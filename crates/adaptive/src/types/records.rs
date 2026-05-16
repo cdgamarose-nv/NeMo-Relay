@@ -6,10 +6,71 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use nemo_flow::codec::response::FinishReason;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::metadata::MetadataEnvelope;
+
+/// Compact backend timing extracted from an annotated LLM response.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackendTiming {
+    /// Backend admission/prefill queue wait in milliseconds, when provided.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prefill_wait_time_ms: Option<f64>,
+    /// Backend prefill execution time in milliseconds, when provided.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prefill_time_ms: Option<f64>,
+    /// Backend time-to-first-token in milliseconds, when provided.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ttft_ms: Option<f64>,
+    /// Backend total request time in milliseconds, when provided.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub total_time_ms: Option<f64>,
+    /// Router queue depth reported by the backend, when provided.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub router_queue_depth: Option<f64>,
+}
+
+impl BackendTiming {
+    /// Whether no timing fields are present.
+    pub fn is_empty(&self) -> bool {
+        self.prefill_wait_time_ms.is_none()
+            && self.prefill_time_ms.is_none()
+            && self.ttft_ms.is_none()
+            && self.total_time_ms.is_none()
+            && self.router_queue_depth.is_none()
+    }
+}
+
+/// Adaptive hint feedback captured at request time for learner updates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CallAdaptiveHints {
+    /// Priority residual arm selected on the request path, when adaptive priority is enabled.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub selected_priority_residual_arm: Option<u8>,
+    /// Context key used for the selected priority residual decision, when present.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub selected_priority_residual_key: Option<String>,
+    /// Final priority emitted to the backend.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub emitted_priority: Option<u32>,
+    /// Maximum priority allowed by the structural policy for this call.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub priority_cap: Option<u32>,
+    /// RLS budgeted output sequence length used on the request path.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub predicted_osl: Option<u32>,
+    /// Estimated model service time used for priority/deadline reasoning.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub estimated_service_ms: Option<u64>,
+    /// Workflow SLA visible when the request was issued.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub workflow_sla_ms: Option<u64>,
+    /// Workflow elapsed time visible when the request was issued.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub workflow_elapsed_ms_at_call_start: Option<u64>,
+}
 
 /// Kind of runtime call captured in adaptive telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,6 +123,21 @@ pub struct CallRecord {
     /// Agent/function scope path captured at call-start time.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub function_path: Vec<String>,
+    /// Runtime parent scope UUID for this call, when available.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent_uuid: Option<Uuid>,
+    /// Run-local ordinal for this call, starting at one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run_call_index: Option<u32>,
+    /// Normalized finish reason, when reported by the provider.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub finish_reason: Option<FinishReason>,
+    /// Backend timing extracted from response metadata, when available.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub backend_timing: Option<BackendTiming>,
+    /// Adaptive hints and learner feedback captured when the request was issued.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub adaptive_hints: Option<CallAdaptiveHints>,
 }
 
 impl Default for CallRecord {
@@ -80,6 +156,11 @@ impl Default for CallRecord {
             annotated_request: None,
             annotated_response: None,
             function_path: vec![],
+            parent_uuid: None,
+            run_call_index: None,
+            finish_reason: None,
+            backend_timing: None,
+            adaptive_hints: None,
         }
     }
 }

@@ -47,16 +47,9 @@ pub(crate) fn event_to_call_record(event: &Event, scope_path: &[String]) -> Opti
         kind,
         name: event.name().to_string(),
         started_at: *event.timestamp(),
-        ended_at: None,
-        metadata_snapshot: None,
-        output_tokens: None,
-        prompt_tokens: None,
-        total_tokens: None,
-        model_name: None,
-        tool_call_count: None,
         annotated_request,
-        annotated_response: None,
         function_path: scope_path.to_vec(),
+        ..CallRecord::default()
     })
 }
 

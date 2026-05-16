@@ -17,12 +17,19 @@ use crate::learner::traits::Learner;
 use crate::storage::traits::StorageBackendDyn;
 use crate::subscriber::{event_to_call_record, is_run_boundary};
 use crate::types::cache::HotCache;
-use crate::types::records::{CallRecord, RunRecord};
+use crate::types::records::{BackendTiming, CallRecord, RunRecord};
+
+#[derive(Debug, Clone, Copy)]
+struct CallLocator {
+    root_uuid: Uuid,
+    call_index: usize,
+}
 
 pub(crate) struct RunAccumulator {
     agent_id: String,
     open_runs: HashMap<Uuid, RunRecord>,
     event_roots: HashMap<Uuid, Uuid>,
+    open_call_index: HashMap<Uuid, CallLocator>,
 }
 
 impl RunAccumulator {
@@ -31,6 +38,7 @@ impl RunAccumulator {
             agent_id,
             open_runs: HashMap::new(),
             event_roots: HashMap::new(),
+            open_call_index: HashMap::new(),
         }
     }
 
@@ -96,6 +104,8 @@ impl RunAccumulator {
             .event_roots
             .remove(&event.uuid())
             .unwrap_or_else(|| event.uuid());
+        self.open_call_index
+            .retain(|_, locator| locator.root_uuid != root_uuid);
         let mut run = self.open_runs.remove(&root_uuid)?;
         run.ended_at = Some(*event.timestamp());
         Some(run)
@@ -118,17 +128,27 @@ impl RunAccumulator {
     fn track_call_start(&mut self, event: &Event, scope_path: &[String]) -> Option<()> {
         let root_uuid = self.infer_root_uuid(event)?;
         self.event_roots.insert(event.uuid(), root_uuid);
-        if let Some(record) = event_to_call_record(event, scope_path)
+        if let Some(mut record) = event_to_call_record(event, scope_path)
             && let Some(run) = self.open_runs.get_mut(&root_uuid)
         {
+            let call_index = run.calls.len();
+            record.parent_uuid = event.parent_uuid();
+            record.run_call_index = Some(call_index as u32 + 1);
             run.calls.push(record);
+            self.open_call_index
+                .insert(event.uuid(), CallLocator { root_uuid, call_index });
         }
         Some(())
     }
 
     fn track_call_end(&mut self, event: &Event) -> Option<()> {
         let root_uuid = self.infer_root_uuid(event)?;
-        if let Some(run) = self.open_runs.get_mut(&root_uuid)
+        if let Some(locator) = self.open_call_index.remove(&event.uuid())
+            && let Some(call) = self.call_mut(locator)
+        {
+            call.ended_at = Some(*event.timestamp());
+            apply_llm_end_metadata(call, event);
+        } else if let Some(run) = self.open_runs.get_mut(&root_uuid)
             && let Some(call) = find_open_call(run, event.name())
         {
             call.ended_at = Some(*event.timestamp());
@@ -136,6 +156,12 @@ impl RunAccumulator {
         }
         self.event_roots.remove(&event.uuid());
         Some(())
+    }
+
+    fn call_mut(&mut self, locator: CallLocator) -> Option<&mut CallRecord> {
+        self.open_runs
+            .get_mut(&locator.root_uuid)
+            .and_then(|run| run.calls.get_mut(locator.call_index))
     }
 
     fn infer_root_uuid(&self, event: &Event) -> Option<Uuid> {
@@ -173,6 +199,31 @@ fn apply_llm_end_metadata(call: &mut CallRecord, event: &Event) {
         .tool_calls
         .as_ref()
         .map(|calls| calls.len() as u32);
+    call.finish_reason = annotated.finish_reason.clone();
+    call.backend_timing = backend_timing_from_response_extra(&annotated.extra);
+}
+
+fn backend_timing_from_response_extra(
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<BackendTiming> {
+    let timing = extra
+        .get("nvext")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|nvext| nvext.get("timing"))
+        .and_then(serde_json::Value::as_object)?;
+    let backend_timing = BackendTiming {
+        prefill_wait_time_ms: read_nonnegative_f64(timing.get("prefill_wait_time_ms")),
+        prefill_time_ms: read_nonnegative_f64(timing.get("prefill_time_ms")),
+        ttft_ms: read_nonnegative_f64(timing.get("ttft_ms")),
+        total_time_ms: read_nonnegative_f64(timing.get("total_time_ms")),
+        router_queue_depth: read_nonnegative_f64(timing.get("router_queue_depth")),
+    };
+    (!backend_timing.is_empty()).then_some(backend_timing)
+}
+
+fn read_nonnegative_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    let ms = value?.as_f64()?;
+    ms.is_finite().then_some(ms.max(0.0))
 }
 
 async fn store_run(
