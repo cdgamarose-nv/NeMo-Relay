@@ -26,6 +26,8 @@ pub mod plugin_component;
 #[cfg(feature = "redis-backend")]
 pub mod redis;
 mod runtime;
+#[cfg_attr(not(test), allow(dead_code))]
+mod scheduling;
 /// Storage backends and backend traits for adaptive state persistence.
 pub mod storage;
 pub mod subscriber;
