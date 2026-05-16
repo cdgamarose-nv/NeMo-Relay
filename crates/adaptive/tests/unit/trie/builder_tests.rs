@@ -52,6 +52,7 @@ fn make_test_run(llm_count: usize, tool_count: usize) -> RunRecord {
             tool_call_count: None,
             annotated_request: None,
             annotated_response: None,
+            ..Default::default()
         });
         offset_ms += 1100; // 1s call + 100ms gap
     }

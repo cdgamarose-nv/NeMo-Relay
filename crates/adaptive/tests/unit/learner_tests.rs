@@ -41,6 +41,7 @@ fn sample_run(agent_id: &str) -> RunRecord {
                 tool_call_count: Some(1),
                 annotated_request: None,
                 annotated_response: None,
+                ..Default::default()
             },
             CallRecord {
                 kind: CallKind::Tool,
@@ -55,6 +56,7 @@ fn sample_run(agent_id: &str) -> RunRecord {
                 tool_call_count: None,
                 annotated_request: None,
                 annotated_response: None,
+                ..Default::default()
             },
         ],
         started_at,

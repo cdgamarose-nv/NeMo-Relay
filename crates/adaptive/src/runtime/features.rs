@@ -62,8 +62,8 @@ pub struct AdaptiveRuntime {
     hot_cache: Arc<RwLock<HotCache>>,
     cache_diagnostics_tracker: Arc<RwLock<CacheDiagnosticsTracker>>,
     pending_events: Arc<AtomicUsize>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
-    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Event>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<(Event, Vec<String>)>,
+    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(Event, Vec<String>)>>,
     drain_handle: Option<tokio::task::JoinHandle<()>>,
     registered: bool,
     runtime_id: Uuid,
@@ -144,7 +144,7 @@ impl<'a> RegistrationContext<'a> {
             .map_err(Into::into)
     }
 
-    fn take_event_receiver(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Event>> {
+    fn take_event_receiver(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<(Event, Vec<String>)>> {
         self.runtime
             .event_rx
             .take()

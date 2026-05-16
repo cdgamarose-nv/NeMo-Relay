@@ -310,7 +310,7 @@ fn test_accumulator_new_is_empty() {
 fn test_accumulator_start_run() {
     let mut acc = RunAccumulator::new("agent-1".to_string());
     let event = make_agent_start();
-    let result = acc.process_event(&event);
+    let result = acc.process_event(&event, &[]);
     assert!(result.is_none(), "Start should not return a completed run");
     assert_eq!(acc.open_run_count(), 1);
 }
@@ -321,10 +321,10 @@ fn test_accumulator_end_run_returns_record() {
 
     let start = make_agent_start();
     let root_uuid = start.uuid();
-    acc.process_event(&start);
+    acc.process_event(&start, &[]);
 
     let end = make_agent_end(root_uuid);
-    let result = acc.process_event(&end);
+    let result = acc.process_event(&end, &[]);
 
     assert!(result.is_some(), "End should return a completed run");
     let run = result.unwrap();
@@ -340,7 +340,7 @@ fn test_accumulator_collects_calls() {
 
     let start = make_agent_start();
     let root_uuid = start.uuid();
-    acc.process_event(&start);
+    acc.process_event(&start, &[]);
 
     // Tool Start + Tool End
     let tool_uuid = Uuid::now_v7();
@@ -351,7 +351,7 @@ fn test_accumulator_collects_calls() {
         tool_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&tool_start);
+    acc.process_event(&tool_start, &[]);
 
     let tool_end = make_event(
         EventType::End,
@@ -360,7 +360,7 @@ fn test_accumulator_collects_calls() {
         tool_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&tool_end);
+    acc.process_event(&tool_end, &[]);
 
     // LLM Start + LLM End
     let llm_uuid = Uuid::now_v7();
@@ -371,7 +371,7 @@ fn test_accumulator_collects_calls() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_start);
+    acc.process_event(&llm_start, &[]);
 
     let llm_end = make_event(
         EventType::End,
@@ -380,11 +380,11 @@ fn test_accumulator_collects_calls() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_end);
+    acc.process_event(&llm_end, &[]);
 
     // Agent End
     let end = make_agent_end(root_uuid);
-    let result = acc.process_event(&end);
+    let result = acc.process_event(&end, &[]);
 
     let run = result.expect("should return completed run");
     assert_eq!(run.calls.len(), 2, "should have 2 call records");
@@ -404,7 +404,7 @@ fn test_accumulator_tracks_non_agent_scope_roots_and_cleans_them_up() {
 
     let agent_start = make_agent_start();
     let root_uuid = agent_start.uuid();
-    acc.process_event(&agent_start);
+    acc.process_event(&agent_start, &[]);
 
     let function_uuid = Uuid::now_v7();
     let function_start = make_event(
@@ -414,7 +414,7 @@ fn test_accumulator_tracks_non_agent_scope_roots_and_cleans_them_up() {
         function_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&function_start);
+    acc.process_event(&function_start, &[]);
     assert_eq!(acc.event_roots.get(&function_uuid), Some(&root_uuid));
 
     let function_end = make_event(
@@ -424,7 +424,7 @@ fn test_accumulator_tracks_non_agent_scope_roots_and_cleans_them_up() {
         function_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&function_end);
+    acc.process_event(&function_end, &[]);
     assert!(!acc.event_roots.contains_key(&function_uuid));
 }
 
@@ -434,7 +434,7 @@ fn test_accumulator_llm_end_clears_event_root_mapping() {
 
     let agent_start = make_agent_start();
     let root_uuid = agent_start.uuid();
-    acc.process_event(&agent_start);
+    acc.process_event(&agent_start, &[]);
 
     let llm_uuid = Uuid::now_v7();
     let llm_start = make_event(
@@ -444,7 +444,7 @@ fn test_accumulator_llm_end_clears_event_root_mapping() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_start);
+    acc.process_event(&llm_start, &[]);
     assert_eq!(acc.event_roots.get(&llm_uuid), Some(&root_uuid));
 
     let llm_end = make_event(
@@ -454,7 +454,7 @@ fn test_accumulator_llm_end_clears_event_root_mapping() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_end);
+    acc.process_event(&llm_end, &[]);
     assert!(!acc.event_roots.contains_key(&llm_uuid));
 }
 
@@ -464,7 +464,7 @@ fn test_accumulator_tracks_calls_nested_under_non_agent_scope() {
 
     let agent_start = make_agent_start();
     let root_uuid = agent_start.uuid();
-    acc.process_event(&agent_start);
+    acc.process_event(&agent_start, &[]);
 
     let function_uuid = Uuid::now_v7();
     let function_start = make_event(
@@ -474,7 +474,7 @@ fn test_accumulator_tracks_calls_nested_under_non_agent_scope() {
         function_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&function_start);
+    acc.process_event(&function_start, &[]);
 
     let tool_uuid = Uuid::now_v7();
     let tool_start = make_event(
@@ -484,7 +484,7 @@ fn test_accumulator_tracks_calls_nested_under_non_agent_scope() {
         tool_uuid,
         Some(function_uuid),
     );
-    acc.process_event(&tool_start);
+    acc.process_event(&tool_start, &[]);
 
     let tool_end = make_event(
         EventType::End,
@@ -493,7 +493,7 @@ fn test_accumulator_tracks_calls_nested_under_non_agent_scope() {
         tool_uuid,
         Some(function_uuid),
     );
-    acc.process_event(&tool_end);
+    acc.process_event(&tool_end, &[]);
 
     let function_end = make_event(
         EventType::End,
@@ -502,10 +502,10 @@ fn test_accumulator_tracks_calls_nested_under_non_agent_scope() {
         function_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&function_end);
+    acc.process_event(&function_end, &[]);
 
     let run = acc
-        .process_event(&make_agent_end(root_uuid))
+        .process_event(&make_agent_end(root_uuid), &[])
         .expect("agent end should return completed run");
     assert_eq!(run.calls.len(), 1, "nested tool call should be tracked");
     assert_eq!(run.calls[0].name, "search");
@@ -518,7 +518,7 @@ fn test_accumulator_tracks_llm_calls_nested_under_non_agent_scope() {
 
     let agent_start = make_agent_start();
     let root_uuid = agent_start.uuid();
-    acc.process_event(&agent_start);
+    acc.process_event(&agent_start, &[]);
 
     let function_uuid = Uuid::now_v7();
     let function_start = make_event(
@@ -528,7 +528,7 @@ fn test_accumulator_tracks_llm_calls_nested_under_non_agent_scope() {
         function_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&function_start);
+    acc.process_event(&function_start, &[]);
 
     let llm_uuid = Uuid::now_v7();
     let llm_start = make_event(
@@ -538,7 +538,7 @@ fn test_accumulator_tracks_llm_calls_nested_under_non_agent_scope() {
         llm_uuid,
         Some(function_uuid),
     );
-    acc.process_event(&llm_start);
+    acc.process_event(&llm_start, &[]);
 
     let llm_end = make_event(
         EventType::End,
@@ -547,7 +547,7 @@ fn test_accumulator_tracks_llm_calls_nested_under_non_agent_scope() {
         llm_uuid,
         Some(function_uuid),
     );
-    acc.process_event(&llm_end);
+    acc.process_event(&llm_end, &[]);
 
     let function_end = make_event(
         EventType::End,
@@ -556,10 +556,10 @@ fn test_accumulator_tracks_llm_calls_nested_under_non_agent_scope() {
         function_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&function_end);
+    acc.process_event(&function_end, &[]);
 
     let run = acc
-        .process_event(&make_agent_end(root_uuid))
+        .process_event(&make_agent_end(root_uuid), &[])
         .expect("agent end should return completed run");
     assert_eq!(run.calls.len(), 1, "nested llm call should be tracked");
     assert_eq!(run.calls[0].name, "gpt-4");
@@ -570,7 +570,7 @@ fn test_accumulator_tracks_llm_calls_nested_under_non_agent_scope() {
 fn test_accumulator_orphaned_end_returns_none() {
     let mut acc = RunAccumulator::new("agent-1".to_string());
     let end = make_agent_end(Uuid::now_v7());
-    let result = acc.process_event(&end);
+    let result = acc.process_event(&end, &[]);
     assert!(
         result.is_none(),
         "Orphaned end event should not return a run"
@@ -642,11 +642,11 @@ async fn test_drain_task_stores_completed_run() {
     // Send Agent Start
     let start = make_agent_start();
     let root_uuid = start.uuid();
-    tx.send(start).expect("send should succeed");
+    tx.send((start, vec![])).expect("send should succeed");
 
     // Send Agent End
     let end = make_agent_end(root_uuid);
-    tx.send(end).expect("send should succeed");
+    tx.send((end, vec![])).expect("send should succeed");
 
     // Give drain time to process
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -693,8 +693,8 @@ async fn test_drain_task_updates_hot_cache() {
     // Send Agent Start + End to trigger a store + cache refresh
     let start = make_agent_start();
     let root_uuid = start.uuid();
-    tx.send(start).expect("send should succeed");
-    tx.send(make_agent_end(root_uuid))
+    tx.send((start, vec![])).expect("send should succeed");
+    tx.send((make_agent_end(root_uuid), vec![]))
         .expect("send should succeed");
 
     // Give drain time to process
@@ -736,8 +736,8 @@ async fn test_drain_task_continues_when_store_run_fails() {
 
     let start = make_agent_start();
     let end = make_agent_end(start.uuid());
-    tx.send(start).unwrap();
-    tx.send(end).unwrap();
+    tx.send((start, vec![])).unwrap();
+    tx.send((end, vec![])).unwrap();
     drop(tx);
 
     tokio::time::timeout(Duration::from_secs(2), handle)
@@ -775,8 +775,8 @@ async fn test_drain_task_continues_when_learner_and_plan_refresh_fail() {
 
     let start = make_agent_start();
     let end = make_agent_end(start.uuid());
-    tx.send(start).unwrap();
-    tx.send(end).unwrap();
+    tx.send((start, vec![])).unwrap();
+    tx.send((end, vec![])).unwrap();
     drop(tx);
 
     tokio::time::timeout(Duration::from_secs(2), handle)
@@ -833,7 +833,7 @@ fn test_accumulator_extracts_annotated_response() {
     // Agent Start
     let agent_start = make_agent_start();
     let root_uuid = agent_start.uuid();
-    acc.process_event(&agent_start);
+    acc.process_event(&agent_start, &[]);
 
     // LLM Start
     let llm_uuid = Uuid::now_v7();
@@ -844,7 +844,7 @@ fn test_accumulator_extracts_annotated_response() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_start);
+    acc.process_event(&llm_start, &[]);
 
     // LLM End with full annotated response
     let annotated = AnnotatedLlmResponse {
@@ -876,11 +876,11 @@ fn test_accumulator_extracts_annotated_response() {
     };
 
     let llm_end = make_llm_end_with_annotated(llm_uuid, Some(root_uuid), "gpt-4o", annotated);
-    acc.process_event(&llm_end);
+    acc.process_event(&llm_end, &[]);
 
     // Agent End
     let run = acc
-        .process_event(&make_agent_end(root_uuid))
+        .process_event(&make_agent_end(root_uuid), &[])
         .expect("should return completed run");
 
     assert_eq!(run.calls.len(), 1);
@@ -910,7 +910,7 @@ fn test_accumulator_llm_end_no_annotated_response() {
 
     let agent_start = make_agent_start();
     let root_uuid = agent_start.uuid();
-    acc.process_event(&agent_start);
+    acc.process_event(&agent_start, &[]);
 
     // LLM Start + LLM End without annotated (use existing make_event helper)
     let llm_uuid = Uuid::now_v7();
@@ -921,7 +921,7 @@ fn test_accumulator_llm_end_no_annotated_response() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_start);
+    acc.process_event(&llm_start, &[]);
 
     let llm_end = make_event(
         EventType::End,
@@ -930,10 +930,10 @@ fn test_accumulator_llm_end_no_annotated_response() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_end);
+    acc.process_event(&llm_end, &[]);
 
     let run = acc
-        .process_event(&make_agent_end(root_uuid))
+        .process_event(&make_agent_end(root_uuid), &[])
         .expect("should return completed run");
 
     assert_eq!(run.calls.len(), 1);
@@ -968,7 +968,7 @@ fn test_accumulator_annotated_response_partial_data() {
 
     let agent_start = make_agent_start();
     let root_uuid = agent_start.uuid();
-    acc.process_event(&agent_start);
+    acc.process_event(&agent_start, &[]);
 
     let llm_uuid = Uuid::now_v7();
     let llm_start = make_event(
@@ -978,7 +978,7 @@ fn test_accumulator_annotated_response_partial_data() {
         llm_uuid,
         Some(root_uuid),
     );
-    acc.process_event(&llm_start);
+    acc.process_event(&llm_start, &[]);
 
     // Annotated with model but no usage and no tool_calls
     let annotated = AnnotatedLlmResponse {
@@ -993,10 +993,10 @@ fn test_accumulator_annotated_response_partial_data() {
     };
 
     let llm_end = make_llm_end_with_annotated(llm_uuid, Some(root_uuid), "gpt-4o-mini", annotated);
-    acc.process_event(&llm_end);
+    acc.process_event(&llm_end, &[]);
 
     let run = acc
-        .process_event(&make_agent_end(root_uuid))
+        .process_event(&make_agent_end(root_uuid), &[])
         .expect("should return completed run");
 
     assert_eq!(run.calls.len(), 1);

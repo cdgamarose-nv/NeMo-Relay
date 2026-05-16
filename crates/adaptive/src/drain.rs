@@ -39,14 +39,14 @@ impl RunAccumulator {
         self.open_runs.len()
     }
 
-    pub(crate) fn process_event(&mut self, event: &Event) -> Option<RunRecord> {
+    pub(crate) fn process_event(&mut self, event: &Event, scope_path: &[String]) -> Option<RunRecord> {
         if let Some(boundary_result) = self.process_run_boundary(event) {
             return boundary_result;
         }
 
         match (event.scope_category(), event.scope_type()) {
             (Some(ScopeCategory::Start), Some(ScopeType::Tool | ScopeType::Llm)) => {
-                self.track_call_start(event)?;
+                self.track_call_start(event, scope_path)?;
                 None
             }
             (Some(ScopeCategory::End), Some(ScopeType::Tool | ScopeType::Llm)) => {
@@ -115,10 +115,10 @@ impl RunAccumulator {
         }
     }
 
-    fn track_call_start(&mut self, event: &Event) -> Option<()> {
+    fn track_call_start(&mut self, event: &Event, scope_path: &[String]) -> Option<()> {
         let root_uuid = self.infer_root_uuid(event)?;
         self.event_roots.insert(event.uuid(), root_uuid);
-        if let Some(record) = event_to_call_record(event)
+        if let Some(record) = event_to_call_record(event, scope_path)
             && let Some(run) = self.open_runs.get_mut(&root_uuid)
         {
             run.calls.push(record);
@@ -227,7 +227,7 @@ async fn refresh_hot_cache_plan(
 /// the in-flight event counter.
 #[allow(dead_code)]
 pub(crate) async fn drain_task(
-    rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<(Event, Vec<String>)>,
     backend: Arc<dyn StorageBackendDyn + Send + Sync>,
     hot_cache: Arc<RwLock<HotCache>>,
     agent_id: String,
@@ -245,7 +245,7 @@ pub(crate) async fn drain_task(
 }
 
 pub(crate) async fn drain_task_with_counter(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(Event, Vec<String>)>,
     backend: Arc<dyn StorageBackendDyn + Send + Sync>,
     hot_cache: Arc<RwLock<HotCache>>,
     pending_events: Arc<AtomicUsize>,
@@ -254,8 +254,8 @@ pub(crate) async fn drain_task_with_counter(
 ) {
     let mut accumulator = RunAccumulator::new(agent_id.clone());
 
-    while let Some(event) = rx.recv().await {
-        if let Some(completed_run) = accumulator.process_event(&event) {
+    while let Some((event, scope_path)) = rx.recv().await {
+        if let Some(completed_run) = accumulator.process_event(&event, &scope_path) {
             if !store_run(&backend, &completed_run).await {
                 pending_events.fetch_sub(1, Ordering::SeqCst);
                 continue;

@@ -90,6 +90,7 @@ fn run_record_serializes_call_kind_and_optional_fields() {
             tool_call_count: Some(2),
             annotated_request: None,
             annotated_response: None,
+            ..Default::default()
         }],
         started_at: now,
         ended_at: Some(now),

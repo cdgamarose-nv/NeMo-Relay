@@ -61,7 +61,7 @@ fn test_create_subscriber_sends_event() {
     let event = make_test_event(EventType::Start, Some(ScopeType::Llm), Some("gpt-4"));
     subscriber(&event);
 
-    let received = rx.try_recv().expect("should receive event");
+    let (received, _path) = rx.try_recv().expect("should receive event");
     assert_eq!(received.uuid(), event.uuid());
     assert_eq!(received.name(), "gpt-4");
 }
@@ -85,7 +85,7 @@ fn test_subscriber_survives_dropped_receiver() {
 #[test]
 fn test_event_to_call_record_llm_start() {
     let event = make_test_event(EventType::Start, Some(ScopeType::Llm), Some("gpt-4"));
-    let record = event_to_call_record(&event).expect("should produce CallRecord for LLM start");
+    let record = event_to_call_record(&event, &[]).expect("should produce CallRecord for LLM start");
 
     assert_eq!(record.kind, CallKind::Llm);
     assert_eq!(record.name, "gpt-4");
@@ -96,7 +96,7 @@ fn test_event_to_call_record_llm_start() {
 #[test]
 fn test_event_to_call_record_tool_start() {
     let event = make_test_event(EventType::Start, Some(ScopeType::Tool), Some("search"));
-    let record = event_to_call_record(&event).expect("should produce CallRecord for Tool start");
+    let record = event_to_call_record(&event, &[]).expect("should produce CallRecord for Tool start");
 
     assert_eq!(record.kind, CallKind::Tool);
     assert_eq!(record.name, "search");
@@ -107,7 +107,7 @@ fn test_event_to_call_record_tool_start() {
 fn test_event_to_call_record_end_event_returns_none() {
     let event = make_test_event(EventType::End, Some(ScopeType::Llm), Some("gpt-4"));
     assert!(
-        event_to_call_record(&event).is_none(),
+        event_to_call_record(&event, &[]).is_none(),
         "End events should not produce CallRecords"
     );
 }
@@ -140,7 +140,7 @@ fn test_event_to_call_record_llm_end_with_annotated_response_stays_observability
     ));
 
     assert!(
-        event_to_call_record(&event).is_none(),
+        event_to_call_record(&event, &[]).is_none(),
         "annotated_response belongs to LLM end observability, not request/start call records",
     );
 }
@@ -149,7 +149,7 @@ fn test_event_to_call_record_llm_end_with_annotated_response_stays_observability
 fn test_event_to_call_record_agent_scope_returns_none() {
     let event = make_test_event(EventType::Start, Some(ScopeType::Agent), Some("my-agent"));
     assert!(
-        event_to_call_record(&event).is_none(),
+        event_to_call_record(&event, &[]).is_none(),
         "Agent scope events are run boundaries, not call records"
     );
 }
@@ -157,7 +157,7 @@ fn test_event_to_call_record_agent_scope_returns_none() {
 #[test]
 fn test_event_to_call_record_no_name_defaults_to_empty() {
     let event = make_test_event(EventType::Start, Some(ScopeType::Tool), None);
-    let record = event_to_call_record(&event).expect("should produce CallRecord");
+    let record = event_to_call_record(&event, &[]).expect("should produce CallRecord");
     assert_eq!(record.name, "");
 }
 
@@ -199,4 +199,23 @@ fn test_is_run_boundary_agent_mark() {
         !is_run_boundary(&event),
         "Agent Mark should NOT be a run boundary"
     );
+}
+
+// -----------------------------------------------------------------------
+// scope_path / function_path propagation tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_event_to_call_record_propagates_scope_path() {
+    let event = make_test_event(EventType::Start, Some(ScopeType::Llm), Some("gpt-4"));
+    let path = vec!["outer_agent".to_string(), "inner_fn".to_string()];
+    let record = event_to_call_record(&event, &path).expect("should produce CallRecord");
+    assert_eq!(record.function_path, path);
+}
+
+#[test]
+fn test_event_to_call_record_empty_scope_path_produces_empty_function_path() {
+    let event = make_test_event(EventType::Start, Some(ScopeType::Tool), Some("search"));
+    let record = event_to_call_record(&event, &[]).expect("should produce CallRecord");
+    assert!(record.function_path.is_empty());
 }

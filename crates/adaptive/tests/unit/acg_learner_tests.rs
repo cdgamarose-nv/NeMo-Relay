@@ -71,6 +71,7 @@ fn sample_run(requests: Vec<AnnotatedLlmRequest>) -> RunRecord {
                 tool_call_count: None,
                 annotated_request: Some(request.into()),
                 annotated_response: None,
+                ..Default::default()
             })
             .collect(),
         started_at: now,

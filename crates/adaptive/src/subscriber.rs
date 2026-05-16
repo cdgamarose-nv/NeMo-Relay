@@ -11,29 +11,30 @@ use std::sync::{
 use nemo_flow::api::event::{Event, ScopeCategory};
 use nemo_flow::api::runtime::EventSubscriberFn;
 use nemo_flow::api::scope::ScopeType;
-
+use crate::context_helpers::extract_scope_path;
 use crate::types::records::{CallKind, CallRecord};
 
 #[cfg(test)]
 pub(crate) fn create_subscriber(
-    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    tx: tokio::sync::mpsc::UnboundedSender<(Event, Vec<String>)>,
 ) -> EventSubscriberFn {
     create_subscriber_with_counter(tx, Arc::new(AtomicUsize::new(0)))
 }
 
 pub(crate) fn create_subscriber_with_counter(
-    tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    tx: tokio::sync::mpsc::UnboundedSender<(Event, Vec<String>)>,
     pending_events: Arc<AtomicUsize>,
 ) -> EventSubscriberFn {
     std::sync::Arc::new(move |event: &Event| {
         pending_events.fetch_add(1, Ordering::SeqCst);
-        if tx.send(event.clone()).is_err() {
+        let scope_path = extract_scope_path();
+        if tx.send((event.clone(), scope_path)).is_err() {
             pending_events.fetch_sub(1, Ordering::SeqCst);
         }
     })
 }
 
-pub(crate) fn event_to_call_record(event: &Event) -> Option<CallRecord> {
+pub(crate) fn event_to_call_record(event: &Event, scope_path: &[String]) -> Option<CallRecord> {
     if event.scope_category() != Some(ScopeCategory::Start) {
         return None;
     }
@@ -55,6 +56,7 @@ pub(crate) fn event_to_call_record(event: &Event) -> Option<CallRecord> {
         tool_call_count: None,
         annotated_request,
         annotated_response: None,
+        function_path: scope_path.to_vec(),
     })
 }
 

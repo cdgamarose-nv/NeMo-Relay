@@ -59,6 +59,29 @@ pub struct CallRecord {
     /// when available.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub annotated_response: Option<Arc<nemo_flow::codec::response::AnnotatedLlmResponse>>,
+    /// Agent/function scope path captured at call-start time.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub function_path: Vec<String>,
+}
+
+impl Default for CallRecord {
+    fn default() -> Self {
+        Self {
+            kind: CallKind::Llm,
+            name: String::new(),
+            started_at: chrono::DateTime::UNIX_EPOCH.into(),
+            ended_at: None,
+            metadata_snapshot: None,
+            output_tokens: None,
+            prompt_tokens: None,
+            total_tokens: None,
+            model_name: None,
+            tool_call_count: None,
+            annotated_request: None,
+            annotated_response: None,
+            function_path: vec![],
+        }
+    }
 }
 
 /// Telemetry record for one observed agent run.

@@ -40,6 +40,7 @@ fn sample_run(agent_id: &str) -> RunRecord {
             tool_call_count: Some(1),
             annotated_request: None,
             annotated_response: None,
+            ..Default::default()
         }],
         started_at: now,
         ended_at: Some(now),

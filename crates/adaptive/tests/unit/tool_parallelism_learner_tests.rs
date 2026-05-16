@@ -46,6 +46,7 @@ fn make_tool_call(
         tool_call_count: None,
         annotated_request: None,
         annotated_response: None,
+        ..Default::default()
     }
 }
 
@@ -63,6 +64,7 @@ fn make_llm_call(name: &str, base: chrono::DateTime<Utc>) -> CallRecord {
         tool_call_count: None,
         annotated_request: None,
         annotated_response: None,
+        ..Default::default()
     }
 }
 

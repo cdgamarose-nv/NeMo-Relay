@@ -255,6 +255,7 @@ fn sample_run_with_request(agent_id: &str, annotated_request: AnnotatedLlmReques
             tool_call_count: None,
             annotated_request: Some(Arc::new(annotated_request)),
             annotated_response: None,
+            ..Default::default()
         }],
         started_at,
         ended_at: Some(started_at),
@@ -286,6 +287,7 @@ fn sample_run_with_requests(
                 tool_call_count: None,
                 annotated_request: Some(Arc::new(annotated_request)),
                 annotated_response: None,
+                ..Default::default()
             })
             .collect(),
         started_at,
