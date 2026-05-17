@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock;
 
+use crate::dag::DagCpmState;
 use crate::error::{AdaptiveError, Result};
 use crate::storage::traits::{StorageBackend, StorageBackendDyn};
 use crate::trie::accumulator::AccumulatorState;
@@ -24,6 +25,7 @@ pub struct InMemoryBackend {
     plans: RwLock<HashMap<String, ExecutionPlan>>,
     tries: RwLock<HashMap<String, TrieEnvelope>>,
     accumulators: RwLock<HashMap<String, AccumulatorState>>,
+    dag_states: RwLock<HashMap<String, DagCpmState>>,
     observations: RwLock<HashMap<String, Vec<crate::acg::prompt_ir::PromptIR>>>,
     stability: RwLock<HashMap<String, crate::acg::stability::StabilityAnalysisResult>>,
 }
@@ -39,6 +41,7 @@ impl InMemoryBackend {
             plans: RwLock::new(HashMap::new()),
             tries: RwLock::new(HashMap::new()),
             accumulators: RwLock::new(HashMap::new()),
+            dag_states: RwLock::new(HashMap::new()),
             observations: RwLock::new(HashMap::new()),
             stability: RwLock::new(HashMap::new()),
         }
@@ -195,6 +198,44 @@ impl StorageBackendDyn for InMemoryBackend {
                 .map_err(|error| AdaptiveError::Internal(format!("lock poisoned: {error}")));
             match guard {
                 Ok(ref accumulators) => Ok(accumulators.get(agent_id).cloned()),
+                Err(error) => Err(error),
+            }
+        };
+        Box::pin(async move { result })
+    }
+
+    fn store_dag_state<'a>(
+        &'a self,
+        agent_id: &'a str,
+        state: &'a DagCpmState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        let result = {
+            let mut guard = self
+                .dag_states
+                .write()
+                .map_err(|error| AdaptiveError::Internal(format!("lock poisoned: {error}")));
+            match guard {
+                Ok(ref mut dag_states) => {
+                    dag_states.insert(agent_id.to_string(), state.clone());
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        Box::pin(async move { result })
+    }
+
+    fn load_dag_state<'a>(
+        &'a self,
+        agent_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagCpmState>>> + Send + 'a>> {
+        let result = {
+            let guard = self
+                .dag_states
+                .read()
+                .map_err(|error| AdaptiveError::Internal(format!("lock poisoned: {error}")));
+            match guard {
+                Ok(ref dag_states) => Ok(dag_states.get(agent_id).cloned()),
                 Err(error) => Err(error),
             }
         };

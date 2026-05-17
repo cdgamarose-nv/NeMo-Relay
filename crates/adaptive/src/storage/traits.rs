@@ -6,6 +6,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::dag::DagCpmState;
 use crate::error::Result;
 use crate::trie::accumulator::AccumulatorState;
 use crate::trie::serialization::TrieEnvelope;
@@ -68,6 +69,29 @@ pub trait StorageBackendDyn: Send + Sync + 'static {
         &'a self,
         agent_id: &'a str,
     ) -> BoxStorageFuture<'a, Option<AccumulatorState>>;
+
+    /// Persist DAG CPM learner state for an agent.
+    ///
+    /// # Notes
+    /// The default implementation is a no-op.
+    fn store_dag_state<'a>(
+        &'a self,
+        _agent_id: &'a str,
+        _state: &'a DagCpmState,
+    ) -> BoxStorageFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Load DAG CPM learner state for an agent.
+    ///
+    /// # Notes
+    /// The default implementation returns `Ok(None)`.
+    fn load_dag_state<'a>(
+        &'a self,
+        _agent_id: &'a str,
+    ) -> BoxStorageFuture<'a, Option<DagCpmState>> {
+        Box::pin(async move { Ok(None) })
+    }
 
     /// Persist an execution plan for an agent.
     ///

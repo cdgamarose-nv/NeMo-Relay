@@ -17,6 +17,7 @@
 //! | Execution plan | `{prefix}plan:{agent_id}`               | JSON ExecutionPlan |
 //! | Trie envelope  | `{prefix}trie:{agent_id}`               | JSON TrieEnvelope |
 //! | Accumulators   | `{prefix}accumulators:{agent_id}`       | JSON AccumulatorState |
+//! | DAG CPM state  | `{prefix}dag_cpm:{agent_id}`            | JSON DagCpmState |
 
 use std::future::Future;
 use std::pin::Pin;
@@ -24,6 +25,7 @@ use std::pin::Pin;
 use redis::Client;
 use redis::aio::ConnectionManager;
 
+use crate::dag::DagCpmState;
 use crate::error::{AdaptiveError, Result};
 use crate::storage::traits::{StorageBackend, StorageBackendDyn};
 use crate::trie::accumulator::AccumulatorState;
@@ -218,6 +220,39 @@ impl RedisBackend {
             None => Ok(None),
         }
     }
+
+    async fn store_dag_state_impl(&self, agent_id: &str, state: &DagCpmState) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let key = self.key("dag_cpm", agent_id);
+        let json = serde_json::to_string(state).map_err(AdaptiveError::Serialization)?;
+
+        redis::cmd("SET")
+            .arg(&key)
+            .arg(&json)
+            .exec_async(&mut conn)
+            .await
+            .map_err(|e| AdaptiveError::Storage(format!("redis SET dag_cpm: {e}")))?;
+        Ok(())
+    }
+
+    async fn load_dag_state_impl(&self, agent_id: &str) -> Result<Option<DagCpmState>> {
+        let mut conn = self.conn.clone();
+        let key = self.key("dag_cpm", agent_id);
+        let maybe_json: Option<String> =
+            redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| AdaptiveError::Storage(format!("redis GET dag_cpm: {e}")))?;
+
+        match maybe_json {
+            Some(json) => {
+                let state = serde_json::from_str(&json).map_err(AdaptiveError::Serialization)?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl StorageBackend for RedisBackend {
@@ -287,6 +322,21 @@ impl StorageBackendDyn for RedisBackend {
         agent_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AccumulatorState>>> + Send + 'a>> {
         Box::pin(self.load_accumulators_impl(agent_id))
+    }
+
+    fn store_dag_state<'a>(
+        &'a self,
+        agent_id: &'a str,
+        state: &'a DagCpmState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.store_dag_state_impl(agent_id, state))
+    }
+
+    fn load_dag_state<'a>(
+        &'a self,
+        agent_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DagCpmState>>> + Send + 'a>> {
+        Box::pin(self.load_dag_state_impl(agent_id))
     }
 
     fn store_plan(&self, plan: &ExecutionPlan) -> Result<()> {

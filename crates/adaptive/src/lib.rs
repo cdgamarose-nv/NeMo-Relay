@@ -17,6 +17,7 @@ pub mod adaptive_hints_intercept;
 pub mod cache_diagnostics;
 pub mod config;
 pub mod context_helpers;
+pub mod dag;
 pub mod drain;
 pub mod error;
 pub mod intercepts;
