@@ -190,15 +190,6 @@ pub fn resolve_shared_parent_scope_identity() -> Option<SharedParentScopeIdentit
     })
 }
 
-/// Workflow scheduling priority class used by the adaptive priority layer.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SchedulingClass {
-    Interactive,
-    Standard,
-    Background,
-}
-
 #[cfg(test)]
 #[path = "../tests/unit/context_helpers_tests.rs"]
 mod tests;

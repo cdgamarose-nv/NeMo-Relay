@@ -42,6 +42,13 @@ fn run(calls: Vec<CallRecord>) -> RunRecord {
     }
 }
 
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-9,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[test]
 fn completed_run_dag_keeps_tools_but_only_llms_emit_priority() {
     let base = Utc::now();
@@ -254,4 +261,159 @@ fn completed_run_dag_skips_incomplete_calls() {
 
     assert_eq!(graph.nodes.len(), 1);
     assert_eq!(graph.nodes[0].name, "complete");
+}
+
+#[test]
+fn completed_run_cpm_computes_slack_and_criticality_from_fanout_join() {
+    let base = Utc::now();
+    let parent_uuid = Uuid::new_v4();
+    let graph = build_completed_run_dag(&run(vec![
+        call(
+            CallKind::Llm,
+            "planner",
+            base,
+            0,
+            Some(1000),
+            Some(parent_uuid),
+        ),
+        call(
+            CallKind::Tool,
+            "fast",
+            base,
+            1000,
+            Some(2000),
+            Some(parent_uuid),
+        ),
+        call(
+            CallKind::Tool,
+            "slow",
+            base,
+            1000,
+            Some(3000),
+            Some(parent_uuid),
+        ),
+        call(
+            CallKind::Llm,
+            "synth",
+            base,
+            3000,
+            Some(4000),
+            Some(parent_uuid),
+        ),
+    ]));
+
+    let cpm = compute_cpm(&graph, Some(1000.0)).expect("graph is acyclic");
+
+    assert_close(cpm.workflow_finish_ms, 4000.0);
+    assert_close(cpm.queue_horizon_ms, 1000.0);
+
+    let by_name = graph
+        .nodes
+        .iter()
+        .zip(cpm.nodes.iter())
+        .map(|(node, cpm_node)| (node.name.as_str(), cpm_node))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    assert_close(by_name["planner"].slack_ms, 0.0);
+    assert_close(by_name["planner"].criticality, 1.0);
+    assert_close(by_name["fast"].slack_ms, 1000.0);
+    assert_close(by_name["fast"].criticality, 0.0);
+    assert_close(by_name["slow"].slack_ms, 0.0);
+    assert_close(by_name["slow"].criticality, 1.0);
+    assert_close(by_name["synth"].slack_ms, 0.0);
+    assert_close(by_name["synth"].criticality, 1.0);
+}
+
+#[test]
+fn completed_run_cpm_clamps_queue_horizon() {
+    let base = Utc::now();
+    let graph = build_completed_run_dag(&run(vec![call(
+        CallKind::Llm,
+        "single",
+        base,
+        0,
+        Some(10),
+        None,
+    )]));
+
+    assert_close(compute_cpm(&graph, None).unwrap().queue_horizon_ms, 3000.0);
+    assert_close(
+        compute_cpm(&graph, Some(4.0)).unwrap().queue_horizon_ms,
+        1000.0,
+    );
+    assert_close(
+        compute_cpm(&graph, Some(15_000.0))
+            .unwrap()
+            .queue_horizon_ms,
+        9000.0,
+    );
+    assert_close(
+        compute_cpm(&graph, Some(f64::NAN))
+            .unwrap()
+            .queue_horizon_ms,
+        3000.0,
+    );
+}
+
+#[test]
+fn completed_run_cpm_priority_nodes_match_llm_nodes() {
+    let base = Utc::now();
+    let parent_uuid = Uuid::new_v4();
+    let graph = build_completed_run_dag(&run(vec![
+        call(
+            CallKind::Llm,
+            "planner",
+            base,
+            0,
+            Some(10),
+            Some(parent_uuid),
+        ),
+        call(
+            CallKind::Tool,
+            "search",
+            base,
+            10,
+            Some(20),
+            Some(parent_uuid),
+        ),
+        call(
+            CallKind::Llm,
+            "synth",
+            base,
+            20,
+            Some(30),
+            Some(parent_uuid),
+        ),
+    ]));
+    let cpm = compute_cpm(&graph, None).expect("graph is acyclic");
+
+    assert_eq!(
+        cpm.priority_nodes(&graph)
+            .map(|(node, _)| node.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["planner", "synth"]
+    );
+}
+
+#[test]
+fn completed_run_cpm_returns_none_for_cyclic_graph() {
+    let base = Utc::now();
+    let mut graph = build_completed_run_dag(&run(vec![
+        call(CallKind::Llm, "a", base, 0, Some(10), None),
+        call(CallKind::Llm, "b", base, 10, Some(20), None),
+    ]));
+    graph.edges = vec![
+        RunDagEdge {
+            from: 0,
+            to: 1,
+            kind: RunDagEdgeKind::SameParentPhase,
+        },
+        RunDagEdge {
+            from: 1,
+            to: 0,
+            kind: RunDagEdgeKind::SameParentPhase,
+        },
+    ];
+
+    assert!(compute_cpm(&graph, None).is_none());
 }
