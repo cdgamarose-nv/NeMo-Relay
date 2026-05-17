@@ -1,10 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::{Arc, RwLock};
+
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use super::*;
+use crate::learner::traits::Learner;
+use crate::storage::memory::InMemoryBackend;
+use crate::storage::traits::StorageBackendDyn;
+use crate::types::cache::HotCache;
 use crate::types::records::{BackendTiming, CallRecord, RunRecord};
 
 fn call(
@@ -47,6 +53,18 @@ fn assert_close(actual: f64, expected: f64) {
         (actual - expected).abs() < 1e-9,
         "expected {expected}, got {actual}"
     );
+}
+
+fn empty_hot_cache() -> Arc<RwLock<HotCache>> {
+    Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        acg_profiles: std::collections::HashMap::new(),
+        acg_profile_observation_counts: std::collections::HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }))
 }
 
 #[test]
@@ -416,4 +434,148 @@ fn completed_run_cpm_returns_none_for_cyclic_graph() {
     ];
 
     assert!(compute_cpm(&graph, None).is_none());
+}
+
+#[test]
+fn dag_cpm_state_updates_compact_llm_aggregates_only() {
+    let base = Utc::now();
+    let parent_uuid = Uuid::new_v4();
+    let updated_at = base + Duration::milliseconds(5000);
+
+    let mut planner = call(
+        CallKind::Llm,
+        "planner",
+        base,
+        0,
+        Some(1000),
+        Some(parent_uuid),
+    );
+    planner.backend_timing = Some(BackendTiming {
+        prefill_wait_time_ms: Some(1200.0),
+        total_time_ms: Some(2200.0),
+        ..BackendTiming::default()
+    });
+
+    let mut synth = call(
+        CallKind::Llm,
+        "synth",
+        base,
+        3000,
+        Some(4000),
+        Some(parent_uuid),
+    );
+    synth.backend_timing = Some(BackendTiming {
+        prefill_wait_time_ms: Some(2000.0),
+        total_time_ms: Some(3000.0),
+        ..BackendTiming::default()
+    });
+
+    let run = run(vec![
+        planner,
+        call(
+            CallKind::Tool,
+            "fast",
+            base,
+            1000,
+            Some(2000),
+            Some(parent_uuid),
+        ),
+        call(
+            CallKind::Tool,
+            "slow",
+            base,
+            1000,
+            Some(3000),
+            Some(parent_uuid),
+        ),
+        synth,
+    ]);
+
+    let mut state = DagCpmState::new("agent");
+
+    assert!(state.update_from_run(&run, updated_at));
+    assert_eq!(state.nodes.len(), 2);
+    assert!(!state.nodes.contains_key("agent/tool:fast"));
+    assert!(!state.nodes.contains_key("agent/tool:slow"));
+
+    let planner = &state.nodes["agent/llm:planner"];
+    assert_eq!(planner.observation_count, 1);
+    assert_close(planner.duration_ms_ewma, 1000.0);
+    assert_close(planner.slack_ms_ewma, 0.0);
+    assert_close(planner.criticality_ewma, 1.0);
+    assert_close(planner.queue_horizon_ms_ewma, 2000.0);
+    assert_eq!(planner.last_updated_at, Some(updated_at));
+
+    let synth = &state.nodes["agent/llm:synth"];
+    assert_eq!(synth.observation_count, 1);
+    assert_close(synth.duration_ms_ewma, 1000.0);
+    assert_close(synth.slack_ms_ewma, 0.0);
+    assert_close(synth.criticality_ewma, 1.0);
+    assert_close(synth.queue_horizon_ms_ewma, 2000.0);
+    assert_eq!(synth.last_updated_at, Some(updated_at));
+}
+
+#[test]
+fn dag_cpm_state_updates_existing_nodes_with_ewma() {
+    let base = Utc::now();
+    let mut state = DagCpmState::new("agent");
+
+    assert!(state.update_from_run(
+        &run(vec![call(
+            CallKind::Llm,
+            "single",
+            base,
+            0,
+            Some(1000),
+            None,
+        )]),
+        base + Duration::milliseconds(1000),
+    ));
+    assert!(state.update_from_run(
+        &run(vec![call(
+            CallKind::Llm,
+            "single",
+            base,
+            0,
+            Some(3000),
+            None,
+        )]),
+        base + Duration::milliseconds(3000),
+    ));
+
+    let node = &state.nodes["agent/llm:single"];
+    assert_eq!(node.observation_count, 2);
+    assert_close(
+        node.duration_ms_ewma,
+        1000.0 + DAG_CPM_EWMA_ALPHA * (3000.0 - 1000.0),
+    );
+    assert_close(node.slack_ms_ewma, 0.0);
+    assert_close(node.criticality_ewma, 1.0);
+    assert_close(node.queue_horizon_ms_ewma, DEFAULT_QUEUE_HORIZON_MS);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dag_cpm_learner_persists_compact_state() {
+    let base = Utc::now();
+    let backend = InMemoryBackend::new();
+    let hot_cache = empty_hot_cache();
+    let learner = DagCpmLearner::new("agent");
+    let run = run(vec![call(
+        CallKind::Llm,
+        "single",
+        base,
+        0,
+        Some(1000),
+        None,
+    )]);
+
+    learner
+        .process_run(&run, &backend, &hot_cache)
+        .await
+        .unwrap();
+
+    let state = backend.load_dag_state("agent").await.unwrap().unwrap();
+    assert_eq!(state.agent_id, "agent");
+    assert_eq!(state.nodes.len(), 1);
+    assert_eq!(state.nodes["agent/llm:single"].observation_count, 1);
 }

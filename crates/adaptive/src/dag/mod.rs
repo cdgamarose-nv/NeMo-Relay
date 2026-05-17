@@ -6,16 +6,24 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error::Result;
+use crate::learner::traits::Learner;
+use crate::storage::traits::StorageBackendDyn;
+use crate::types::cache::HotCache;
 use crate::types::records::{CallKind, CallRecord, RunRecord};
 
 const JUMP_UNIT_MS: f64 = 1000.0;
 const DEFAULT_QUEUE_HORIZON_MS: f64 = 3000.0;
 const MAX_QUEUE_HORIZON_MS: f64 = 9000.0;
+const DAG_CPM_EWMA_ALPHA: f64 = 0.2;
 
 /// Learned DAG CPM summary for one agent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -25,6 +33,58 @@ pub struct DagCpmState {
     /// Learned per-node summaries keyed by stable structural path.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub nodes: HashMap<String, DagCpmNodeState>,
+}
+
+impl DagCpmState {
+    /// Create an empty DAG CPM state for one agent.
+    pub fn new(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            nodes: HashMap::new(),
+        }
+    }
+
+    /// Update compact aggregates from one completed run.
+    ///
+    /// Returns `true` when at least one priority-emitting node was incorporated.
+    pub(crate) fn update_from_run(&mut self, run: &RunRecord, updated_at: DateTime<Utc>) -> bool {
+        let dag = build_completed_run_dag(run);
+        let Some(cpm) = compute_cpm(&dag, observed_queue_horizon_ms(run)) else {
+            return false;
+        };
+        self.update_from_cpm(&dag, &cpm, updated_at)
+    }
+
+    fn update_from_cpm(
+        &mut self,
+        dag: &CompletedRunDag,
+        cpm: &CompletedRunCpm,
+        updated_at: DateTime<Utc>,
+    ) -> bool {
+        let mut updated = false;
+        for (node, cpm_node) in cpm.priority_nodes(dag) {
+            if !is_valid_sample(
+                node.duration_ms,
+                cpm_node.slack_ms,
+                cpm_node.criticality,
+                cpm.queue_horizon_ms,
+            ) {
+                continue;
+            }
+            self.nodes
+                .entry(node.structural_key.clone())
+                .or_default()
+                .observe(
+                    node.duration_ms,
+                    cpm_node.slack_ms,
+                    cpm_node.criticality,
+                    cpm.queue_horizon_ms,
+                    updated_at,
+                );
+            updated = true;
+        }
+        updated
+    }
 }
 
 /// Learned CPM statistics for one structural workflow node.
@@ -43,6 +103,68 @@ pub struct DagCpmNodeState {
     /// Last update timestamp for retention and staleness checks.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_updated_at: Option<DateTime<Utc>>,
+}
+
+impl DagCpmNodeState {
+    fn observe(
+        &mut self,
+        duration_ms: f64,
+        slack_ms: f64,
+        criticality: f64,
+        queue_horizon_ms: f64,
+        updated_at: DateTime<Utc>,
+    ) {
+        if self.observation_count == 0 {
+            self.duration_ms_ewma = duration_ms;
+            self.slack_ms_ewma = slack_ms;
+            self.criticality_ewma = criticality;
+            self.queue_horizon_ms_ewma = queue_horizon_ms;
+        } else {
+            self.duration_ms_ewma = ewma(self.duration_ms_ewma, duration_ms);
+            self.slack_ms_ewma = ewma(self.slack_ms_ewma, slack_ms);
+            self.criticality_ewma = ewma(self.criticality_ewma, criticality);
+            self.queue_horizon_ms_ewma = ewma(self.queue_horizon_ms_ewma, queue_horizon_ms);
+        }
+        self.observation_count = self.observation_count.saturating_add(1);
+        self.last_updated_at = Some(updated_at);
+    }
+}
+
+/// Learner that persists compact DAG CPM aggregates from completed runs.
+pub struct DagCpmLearner {
+    agent_id: String,
+}
+
+impl DagCpmLearner {
+    /// Create a new DAG CPM learner for one agent.
+    pub fn new(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+        }
+    }
+}
+
+impl Learner for DagCpmLearner {
+    fn process_run<'a>(
+        &'a self,
+        run: &'a RunRecord,
+        backend: &'a dyn StorageBackendDyn,
+        _hot_cache: &'a Arc<RwLock<HotCache>>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut state = backend
+                .load_dag_state(&self.agent_id)
+                .await?
+                .unwrap_or_else(|| DagCpmState::new(&self.agent_id));
+            state.agent_id = self.agent_id.clone();
+
+            let updated_at = run.ended_at.unwrap_or_else(Utc::now);
+            if state.update_from_run(run, updated_at) {
+                backend.store_dag_state(&self.agent_id, &state).await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Completed run graph used as the CPM learner input.
@@ -283,6 +405,40 @@ fn queue_horizon_ms(observed_queue_horizon_ms: Option<f64>) -> f64 {
 
 fn criticality_from_slack(slack_ms: f64, queue_horizon_ms: f64) -> f64 {
     1.0 - (slack_ms.max(0.0) / queue_horizon_ms).clamp(0.0, 1.0)
+}
+
+fn observed_queue_horizon_ms(run: &RunRecord) -> Option<f64> {
+    let mut waits = run
+        .calls
+        .iter()
+        .filter_map(|call| call.backend_timing.as_ref()?.prefill_wait_time_ms)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .collect::<Vec<_>>();
+    if waits.is_empty() {
+        return None;
+    }
+    waits.sort_by(f64::total_cmp);
+    let p90_index = (waits.len() * 9).div_ceil(10).saturating_sub(1);
+    waits.get(p90_index).copied()
+}
+
+fn is_valid_sample(
+    duration_ms: f64,
+    slack_ms: f64,
+    criticality: f64,
+    queue_horizon_ms: f64,
+) -> bool {
+    duration_ms.is_finite()
+        && duration_ms >= 0.0
+        && slack_ms.is_finite()
+        && criticality.is_finite()
+        && (0.0..=1.0).contains(&criticality)
+        && queue_horizon_ms.is_finite()
+        && queue_horizon_ms > 0.0
+}
+
+fn ewma(previous: f64, sample: f64) -> f64 {
+    previous + DAG_CPM_EWMA_ALPHA * (sample - previous)
 }
 
 fn topological_order(predecessors: &[Vec<usize>], successors: &[Vec<usize>]) -> Option<Vec<usize>> {

@@ -38,6 +38,7 @@ use crate::config::{
     ToolParallelismComponentConfig,
 };
 use crate::context_helpers::resolve_agent_id;
+use crate::dag::DagCpmLearner;
 use crate::error::{AdaptiveError, Result};
 use crate::intercepts::create_tool_execution_intercept_with_mode;
 use crate::learner::latency::LatencySensitivityLearner;
@@ -780,6 +781,7 @@ fn build_learners(
                 crate::trie::builder::SensitivityConfig::default(),
             ))),
             "tool_parallelism" => built.push(Box::new(ToolParallelismLearner::new(agent_id))),
+            "dag_cpm" => built.push(Box::new(DagCpmLearner::new(agent_id))),
             "acg" => {
                 if let Some(config) = acg_config {
                     built.push(Box::new(AcgLearner::new(

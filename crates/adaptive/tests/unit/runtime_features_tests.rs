@@ -128,10 +128,14 @@ impl AdaptiveFeature for PartiallyFailingFeature {
 fn build_learners_filters_unknown_entries() {
     let learners = build_learners(
         "agent-a",
-        &["latency_sensitivity".to_string(), "unknown".to_string()],
+        &[
+            "latency_sensitivity".to_string(),
+            "dag_cpm".to_string(),
+            "unknown".to_string(),
+        ],
         None,
     );
-    assert_eq!(learners.len(), 1);
+    assert_eq!(learners.len(), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]
