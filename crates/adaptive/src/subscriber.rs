@@ -8,11 +8,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use crate::context_helpers::extract_scope_path;
+use crate::types::records::{CallKind, CallRecord};
 use nemo_flow::api::event::{Event, ScopeCategory};
 use nemo_flow::api::runtime::EventSubscriberFn;
 use nemo_flow::api::scope::ScopeType;
-use crate::context_helpers::extract_scope_path;
-use crate::types::records::{CallKind, CallRecord};
 
 #[cfg(test)]
 pub(crate) fn create_subscriber(
@@ -47,6 +47,7 @@ pub(crate) fn event_to_call_record(event: &Event, scope_path: &[String]) -> Opti
         kind,
         name: event.name().to_string(),
         started_at: *event.timestamp(),
+        scope_uuid: event.uuid(),
         annotated_request,
         function_path: scope_path.to_vec(),
         ..CallRecord::default()

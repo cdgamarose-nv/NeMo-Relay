@@ -85,10 +85,12 @@ fn test_subscriber_survives_dropped_receiver() {
 #[test]
 fn test_event_to_call_record_llm_start() {
     let event = make_test_event(EventType::Start, Some(ScopeType::Llm), Some("gpt-4"));
-    let record = event_to_call_record(&event, &[]).expect("should produce CallRecord for LLM start");
+    let record =
+        event_to_call_record(&event, &[]).expect("should produce CallRecord for LLM start");
 
     assert_eq!(record.kind, CallKind::Llm);
     assert_eq!(record.name, "gpt-4");
+    assert_eq!(record.scope_uuid, event.uuid());
     assert!(record.ended_at.is_none());
     assert!(record.metadata_snapshot.is_none());
 }
@@ -96,10 +98,12 @@ fn test_event_to_call_record_llm_start() {
 #[test]
 fn test_event_to_call_record_tool_start() {
     let event = make_test_event(EventType::Start, Some(ScopeType::Tool), Some("search"));
-    let record = event_to_call_record(&event, &[]).expect("should produce CallRecord for Tool start");
+    let record =
+        event_to_call_record(&event, &[]).expect("should produce CallRecord for Tool start");
 
     assert_eq!(record.kind, CallKind::Tool);
     assert_eq!(record.name, "search");
+    assert_eq!(record.scope_uuid, event.uuid());
     assert!(record.ended_at.is_none());
 }
 

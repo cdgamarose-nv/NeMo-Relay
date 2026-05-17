@@ -94,6 +94,9 @@ pub struct CallRecord {
     /// Timestamp when the call finished, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<DateTime<Utc>>,
+    /// Runtime scope UUID for this call.
+    #[serde(default)]
+    pub scope_uuid: Uuid,
     /// Adaptive metadata snapshot associated with the call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_snapshot: Option<MetadataEnvelope>,
@@ -147,6 +150,7 @@ impl Default for CallRecord {
             name: String::new(),
             started_at: chrono::DateTime::UNIX_EPOCH.into(),
             ended_at: None,
+            scope_uuid: Uuid::nil(),
             metadata_snapshot: None,
             output_tokens: None,
             prompt_tokens: None,
