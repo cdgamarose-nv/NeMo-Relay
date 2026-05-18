@@ -47,7 +47,11 @@ impl RunAccumulator {
         self.open_runs.len()
     }
 
-    pub(crate) fn process_event(&mut self, event: &Event, scope_path: &[String]) -> Option<RunRecord> {
+    pub(crate) fn process_event(
+        &mut self,
+        event: &Event,
+        scope_path: &[String],
+    ) -> Option<RunRecord> {
         if let Some(boundary_result) = self.process_run_boundary(event) {
             return boundary_result;
         }
@@ -135,8 +139,13 @@ impl RunAccumulator {
             record.parent_uuid = event.parent_uuid();
             record.run_call_index = Some(call_index as u32 + 1);
             run.calls.push(record);
-            self.open_call_index
-                .insert(event.uuid(), CallLocator { root_uuid, call_index });
+            self.open_call_index.insert(
+                event.uuid(),
+                CallLocator {
+                    root_uuid,
+                    call_index,
+                },
+            );
         }
         Some(())
     }
@@ -276,7 +285,7 @@ async fn refresh_hot_cache_plan(
 /// Convenience wrapper around [`drain_task_with_counter`] used by tests. The
 /// adaptive runtime spawns `drain_task_with_counter` directly so it can observe
 /// the in-flight event counter.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn drain_task(
     rx: tokio::sync::mpsc::UnboundedReceiver<(Event, Vec<String>)>,
     backend: Arc<dyn StorageBackendDyn + Send + Sync>,

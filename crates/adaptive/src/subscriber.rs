@@ -48,6 +48,7 @@ pub(crate) fn event_to_call_record(event: &Event, scope_path: &[String]) -> Opti
         name: event.name().to_string(),
         started_at: *event.timestamp(),
         scope_uuid: event.uuid(),
+        tool_call_id: event.tool_call_id().map(str::to_string),
         annotated_request,
         function_path: scope_path.to_vec(),
         ..CallRecord::default()

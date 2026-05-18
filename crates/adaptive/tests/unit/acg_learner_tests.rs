@@ -84,6 +84,7 @@ fn empty_cache() -> Arc<RwLock<HotCache>> {
         plan: None,
         trie: None,
         agent_hints_default: None,
+        dag_cpm: None,
         acg_profiles: HashMap::new(),
         acg_profile_observation_counts: HashMap::new(),
         acg_stability: None,

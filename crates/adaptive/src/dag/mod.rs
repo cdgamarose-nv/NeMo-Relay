@@ -3,18 +3,17 @@
 
 //! DAG CPM state and completed-run graph construction.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use nemo_flow::codec::request::Message;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{AdaptiveError, Result};
 use crate::learner::traits::Learner;
 use crate::storage::traits::StorageBackendDyn;
 use crate::types::cache::HotCache;
@@ -24,6 +23,10 @@ const JUMP_UNIT_MS: f64 = 1000.0;
 const DEFAULT_QUEUE_HORIZON_MS: f64 = 3000.0;
 const MAX_QUEUE_HORIZON_MS: f64 = 9000.0;
 const DAG_CPM_EWMA_ALPHA: f64 = 0.2;
+const DAG_CPM_RETENTION_DAYS: i64 = 14;
+const DAG_CPM_MAX_NODES: usize = 512;
+pub(crate) const DEFAULT_DAG_PRIORITY_CAP: u32 = 3;
+pub(crate) const MAX_DAG_PRIORITY_CAP: u32 = 5;
 
 /// Learned DAG CPM summary for one agent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -52,7 +55,9 @@ impl DagCpmState {
         let Some(cpm) = compute_cpm(&dag, observed_queue_horizon_ms(run)) else {
             return false;
         };
-        self.update_from_cpm(&dag, &cpm, updated_at)
+        let updated = self.update_from_cpm(&dag, &cpm, updated_at);
+        let pruned = self.prune(updated_at);
+        updated || pruned
     }
 
     fn update_from_cpm(
@@ -84,6 +89,32 @@ impl DagCpmState {
             updated = true;
         }
         updated
+    }
+
+    fn prune(&mut self, now: DateTime<Utc>) -> bool {
+        let cutoff = now - Duration::days(DAG_CPM_RETENTION_DAYS);
+        let initial_len = self.nodes.len();
+        self.nodes
+            .retain(|_, node| node.last_updated_at.is_none_or(|updated_at| updated_at >= cutoff));
+
+        if self.nodes.len() <= DAG_CPM_MAX_NODES {
+            return self.nodes.len() != initial_len;
+        }
+
+        let mut entries = self
+            .nodes
+            .iter()
+            .map(|(key, node)| (key.clone(), node.last_updated_at, node.observation_count))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, last_updated_at, observation_count)| {
+            (*last_updated_at, *observation_count)
+        });
+
+        let remove_count = self.nodes.len() - DAG_CPM_MAX_NODES;
+        for (key, _, _) in entries.into_iter().take(remove_count) {
+            self.nodes.remove(&key);
+        }
+        true
     }
 }
 
@@ -149,7 +180,7 @@ impl Learner for DagCpmLearner {
         &'a self,
         run: &'a RunRecord,
         backend: &'a dyn StorageBackendDyn,
-        _hot_cache: &'a Arc<RwLock<HotCache>>,
+        hot_cache: &'a Arc<RwLock<HotCache>>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let mut state = backend
@@ -161,6 +192,10 @@ impl Learner for DagCpmLearner {
             let updated_at = run.ended_at.unwrap_or_else(Utc::now);
             if state.update_from_run(run, updated_at) {
                 backend.store_dag_state(&self.agent_id, &state).await?;
+                let mut guard = hot_cache.write().map_err(|error| {
+                    AdaptiveError::Internal(format!("hot cache lock poisoned: {error}"))
+                })?;
+                guard.dag_cpm = Some(state);
             }
             Ok(())
         })
@@ -176,13 +211,6 @@ pub(crate) struct CompletedRunDag {
     pub(crate) nodes: Vec<RunDagNode>,
     /// Dependency edges between completed calls.
     pub(crate) edges: Vec<RunDagEdge>,
-}
-
-impl CompletedRunDag {
-    /// Iterate only the nodes that may emit backend priority hints.
-    pub(crate) fn priority_nodes(&self) -> impl Iterator<Item = &RunDagNode> {
-        self.nodes.iter().filter(|node| node.emits_priority)
-    }
 }
 
 /// CPM result for one completed run graph.
@@ -257,6 +285,12 @@ pub(crate) struct RunDagNode {
     pub(crate) duration_ms: f64,
     /// Whether this node is allowed to emit a backend priority hint.
     pub(crate) emits_priority: bool,
+    /// Provider tool-call id carried by tool execution events.
+    pub(crate) tool_call_id: Option<String>,
+    /// Tool-call ids emitted by this LLM response.
+    pub(crate) emitted_tool_call_ids: Vec<String>,
+    /// Tool-call ids consumed as tool result messages by this LLM request.
+    pub(crate) consumed_tool_call_ids: Vec<String>,
 }
 
 /// Run-local dependency edge.
@@ -275,8 +309,12 @@ pub(crate) struct RunDagEdge {
 pub(crate) enum RunDagEdgeKind {
     /// A represented parent call completed before this child call started.
     ParentScope,
-    /// Calls were observed as non-overlapping phases inside the same parent scope.
-    SameParentPhase,
+    /// An LLM request consumed a tool result emitted by an earlier LLM response.
+    LlmToolResult,
+    /// An LLM response requested a tool call later executed by a tool node.
+    LlmToolCall,
+    /// A later LLM request consumed a tool result produced by a tool node.
+    ToolResult,
 }
 
 /// Build a conservative run-local DAG from one completed run.
@@ -316,13 +354,16 @@ pub(crate) fn build_completed_run_dag(run: &RunRecord) -> CompletedRunDag {
             ended_at,
             duration_ms: cpm_duration_ms(call, ended_at),
             emits_priority: call.kind == CallKind::Llm,
+            tool_call_id: call.tool_call_id.clone(),
+            emitted_tool_call_ids: emitted_tool_call_ids(call),
+            consumed_tool_call_ids: consumed_tool_call_ids(call),
         });
     }
 
     let mut edges = Vec::new();
     let mut seen_edges = HashSet::new();
     add_parent_scope_edges(&nodes, &mut edges, &mut seen_edges);
-    add_same_parent_phase_edges(&nodes, &mut edges, &mut seen_edges);
+    add_tool_call_edges(&nodes, &mut edges, &mut seen_edges);
     edges.sort_by_key(|edge| (edge.from, edge.to, edge.kind as u8));
 
     CompletedRunDag {
@@ -488,12 +529,40 @@ fn structural_key(call: &CallRecord) -> String {
         CallKind::Llm => "llm",
         CallKind::Tool => "tool",
     };
-    let path = if call.function_path.is_empty() {
+    structural_key_parts(kind, &call.function_path, &call.name)
+}
+
+/// Build the learned structural key for a hot-path LLM request.
+pub(crate) fn llm_structural_key(function_path: &[String], name: &str) -> String {
+    structural_key_parts("llm", function_path, name)
+}
+
+/// Project learned CPM criticality onto the bounded backend priority scale.
+///
+/// `priority_adjustment` is the optional correction layer. It defaults to `0`
+/// until a separate adjustment learner is wired.
+pub(crate) fn project_priority_prior(
+    state: &DagCpmNodeState,
+    priority_adjustment: i32,
+    priority_cap: u32,
+) -> Option<u32> {
+    let criticality = state.criticality_ewma;
+    if !criticality.is_finite() {
+        return None;
+    }
+    let priority_cap = priority_cap.min(MAX_DAG_PRIORITY_CAP);
+    let priority_prior = (priority_cap as f64 * criticality.clamp(0.0, 1.0)).round();
+    let priority = priority_prior as i32 + priority_adjustment;
+    Some(priority.clamp(0, priority_cap as i32) as u32)
+}
+
+fn structural_key_parts(kind: &str, function_path: &[String], name: &str) -> String {
+    let path = if function_path.is_empty() {
         "root".to_string()
     } else {
-        call.function_path.join("/")
+        function_path.join("/")
     };
-    format!("{path}/{kind}:{}", call.name)
+    format!("{path}/{kind}:{name}")
 }
 
 fn cpm_duration_ms(call: &CallRecord, ended_at: DateTime<Utc>) -> f64 {
@@ -508,6 +577,35 @@ fn cpm_duration_ms(call: &CallRecord, ended_at: DateTime<Utc>) -> f64 {
         }
     }
     observed_duration_ms(call.started_at, ended_at)
+}
+
+fn emitted_tool_call_ids(call: &CallRecord) -> Vec<String> {
+    call.annotated_response
+        .as_ref()
+        .and_then(|response| response.tool_calls.as_ref())
+        .map(|tool_calls| {
+            tool_calls
+                .iter()
+                .map(|tool_call| tool_call.id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn consumed_tool_call_ids(call: &CallRecord) -> Vec<String> {
+    call.annotated_request
+        .as_ref()
+        .map(|request| {
+            request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn observed_duration_ms(started_at: DateTime<Utc>, ended_at: DateTime<Utc>) -> f64 {
@@ -548,65 +646,70 @@ fn add_parent_scope_edges(
     }
 }
 
-fn add_same_parent_phase_edges(
+fn add_tool_call_edges(
     nodes: &[RunDagNode],
     edges: &mut Vec<RunDagEdge>,
     seen_edges: &mut HashSet<(usize, usize, RunDagEdgeKind)>,
 ) {
-    let mut groups: HashMap<Uuid, Vec<usize>> = HashMap::new();
+    let tools_by_call_id = nodes
+        .iter()
+        .filter_map(|node| {
+            let tool_call_id = node.tool_call_id.as_ref()?;
+            Some((tool_call_id.as_str(), node.index))
+        })
+        .collect::<HashMap<_, _>>();
+    let llms_by_emitted_tool_call_id = nodes
+        .iter()
+        .filter(|node| node.kind == CallKind::Llm)
+        .flat_map(|node| {
+            node.emitted_tool_call_ids
+                .iter()
+                .map(move |tool_call_id| (tool_call_id.as_str(), node.index))
+        })
+        .collect::<HashMap<_, _>>();
+
     for node in nodes {
-        if let Some(parent_uuid) = node.parent_uuid {
-            groups.entry(parent_uuid).or_default().push(node.index);
-        }
-    }
-
-    for mut group in groups.into_values() {
-        group.sort_by_key(|&index| (nodes[index].started_at, nodes[index].ended_at, index));
-        add_phase_edges_for_group(nodes, &group, edges, seen_edges);
-    }
-}
-
-fn add_phase_edges_for_group(
-    nodes: &[RunDagNode],
-    group: &[usize],
-    edges: &mut Vec<RunDagEdge>,
-    seen_edges: &mut HashSet<(usize, usize, RunDagEdgeKind)>,
-) {
-    let mut current_phase: Vec<usize> = Vec::new();
-    let mut phase_predecessors: Vec<usize> = Vec::new();
-
-    for &node_index in group {
-        if current_phase.is_empty() {
-            current_phase.push(node_index);
-            continue;
-        }
-
-        if current_phase
-            .iter()
-            .all(|&active_index| nodes[active_index].ended_at <= nodes[node_index].started_at)
-        {
-            phase_predecessors = current_phase;
-            for &predecessor in &phase_predecessors {
+        for tool_call_id in &node.emitted_tool_call_ids {
+            let Some(&tool_index) = tools_by_call_id.get(tool_call_id.as_str()) else {
+                continue;
+            };
+            if node.ended_at <= nodes[tool_index].started_at {
                 push_edge(
                     edges,
                     seen_edges,
-                    predecessor,
-                    node_index,
-                    RunDagEdgeKind::SameParentPhase,
+                    node.index,
+                    tool_index,
+                    RunDagEdgeKind::LlmToolCall,
                 );
             }
-            current_phase = vec![node_index];
-        } else {
-            for &predecessor in &phase_predecessors {
+        }
+
+        for tool_call_id in &node.consumed_tool_call_ids {
+            if node.kind == CallKind::Llm
+                && let Some(&llm_index) = llms_by_emitted_tool_call_id.get(tool_call_id.as_str())
+                && nodes[llm_index].ended_at <= node.started_at
+            {
                 push_edge(
                     edges,
                     seen_edges,
-                    predecessor,
-                    node_index,
-                    RunDagEdgeKind::SameParentPhase,
+                    llm_index,
+                    node.index,
+                    RunDagEdgeKind::LlmToolResult,
                 );
             }
-            current_phase.push(node_index);
+
+            let Some(&tool_index) = tools_by_call_id.get(tool_call_id.as_str()) else {
+                continue;
+            };
+            if nodes[tool_index].ended_at <= node.started_at {
+                push_edge(
+                    edges,
+                    seen_edges,
+                    tool_index,
+                    node.index,
+                    RunDagEdgeKind::ToolResult,
+                );
+            }
         }
     }
 }

@@ -8,6 +8,7 @@
 //!
 //! - [`extract_scope_path`]: collects function names from the scope stack for trie lookup
 //! - [`read_manual_latency_sensitivity`]: walks all scopes for manual `latency_sensitive` annotations
+//! - [`read_workflow_class`]: reads workflow scheduling class metadata for priority caps
 //! - [`resolve_agent_id`]: returns the first Agent scope name from the scope stack
 //!
 //! All functions are safe to call from sync contexts (intercepts are sync closures).
@@ -17,6 +18,11 @@
 //!
 //! Manual latency sensitivity is stored in scope metadata under the JSON path
 //! `/nemo_flow_adaptive/latency_sensitivity` as a positive integer.
+//!
+//! Workflow class is stored in scope metadata under
+//! `/nemo_flow_adaptive/workflow_class` or the legacy
+//! `/nemo_flow_adaptive/scheduling_class` as `"interactive"`, `"standard"`, or
+//! `"background"`.
 
 use nemo_flow::api::runtime::current_scope_stack;
 use nemo_flow::api::scope::ScopeType;
@@ -24,6 +30,32 @@ use uuid::Uuid;
 
 /// Metadata key path for manual latency sensitivity annotation.
 pub const LATENCY_SENSITIVITY_POINTER: &str = "/nemo_flow_adaptive/latency_sensitivity";
+/// Metadata key path for workflow class annotation.
+pub const WORKFLOW_CLASS_POINTER: &str = "/nemo_flow_adaptive/workflow_class";
+/// Metadata key path for legacy workflow scheduling class annotation.
+pub const SCHEDULING_CLASS_POINTER: &str = "/nemo_flow_adaptive/scheduling_class";
+
+/// Workflow-level scheduling class visible on the current scope stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowClass {
+    /// User-visible request expected to return quickly.
+    Interactive,
+    /// Ordinary workflow with no special latency class.
+    Standard,
+    /// Background workflow.
+    Background,
+}
+
+impl WorkflowClass {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "interactive" => Some(Self::Interactive),
+            "standard" => Some(Self::Standard),
+            "background" => Some(Self::Background),
+            _ => None,
+        }
+    }
+}
 
 /// Session-local scope identity used to coordinate warm-first cohorts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +122,33 @@ pub fn read_manual_latency_sensitivity() -> Option<u32> {
         }
     }
     max_val
+}
+
+/// Reads the nearest workflow class from visible scope metadata.
+///
+/// The deepest scope wins, which lets a workflow mark a nested branch as
+/// background or interactive without changing the root workflow metadata.
+pub fn read_workflow_class() -> Option<WorkflowClass> {
+    let stack_handle = current_scope_stack();
+    let stack = match stack_handle.read() {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let mut workflow_class = None;
+    for scope in stack.scopes() {
+        if let Some(ref meta) = scope.metadata {
+            let parsed = meta
+                .pointer(WORKFLOW_CLASS_POINTER)
+                .or_else(|| meta.pointer(SCHEDULING_CLASS_POINTER))
+                .and_then(|value| value.as_str())
+                .and_then(WorkflowClass::parse);
+            if parsed.is_some() {
+                workflow_class = parsed;
+            }
+        }
+    }
+    workflow_class
 }
 
 /// Sets latency sensitivity on the current (top) scope using max-merge semantics.

@@ -229,6 +229,7 @@ fn empty_hot_cache() -> Arc<RwLock<HotCache>> {
         plan: None,
         trie: None,
         agent_hints_default: None,
+        dag_cpm: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,

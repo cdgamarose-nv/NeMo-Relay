@@ -4,8 +4,10 @@
 //! Unit tests for adaptive hints intercept in the NeMo Flow adaptive crate.
 
 use super::*;
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::dag::{DagCpmNodeState, DagCpmState};
 use crate::trie::data_models::{LlmCallPrediction, PredictionMetrics};
 use nemo_flow::api::runtime::current_scope_stack;
 use nemo_flow::api::scope::ScopeType;
@@ -48,6 +50,30 @@ fn make_prediction(latency_sensitivity: Option<u32>) -> LlmCallPrediction {
             p95: 180.0,
         },
         latency_sensitivity,
+    }
+}
+
+fn annotated_with_messages(messages: Vec<Message>) -> AnnotatedLlmRequest {
+    AnnotatedLlmRequest {
+        messages,
+        model: Some("model".into()),
+        params: None,
+        tools: None,
+        tool_choice: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -101,6 +127,7 @@ fn test_adaptive_hints_intercept_new() {
         plan: None,
         trie: None,
         agent_hints_default: None,
+        dag_cpm: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -117,6 +144,7 @@ fn test_adaptive_hints_intercept_into_request_fn_compiles() {
         plan: None,
         trie: None,
         agent_hints_default: None,
+        dag_cpm: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -145,6 +173,7 @@ fn test_adaptive_hints_intercept_injects_prediction_hints_and_manual_override() 
         plan: None,
         trie: Some(root),
         agent_hints_default: None,
+        dag_cpm: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -249,6 +278,7 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
         plan: None,
         trie: None,
         agent_hints_default: Some(defaults.clone()),
+        dag_cpm: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -279,6 +309,7 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
         plan: None,
         trie: None,
         agent_hints_default: Some(defaults),
+        dag_cpm: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -311,6 +342,299 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
     assert_eq!(
         poisoned_request.content,
         serde_json::json!({"existing": true})
+    );
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_overrides_cached_priority_from_dag_cpm() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let mut dag_cpm = DagCpmState::new("fallback-agent");
+    dag_cpm.nodes.insert(
+        "root/llm:model".to_string(),
+        DagCpmNodeState {
+            observation_count: 3,
+            duration_ms_ewma: 1000.0,
+            slack_ms_ewma: 0.0,
+            criticality_ewma: 1.0,
+            queue_horizon_ms_ewma: 3000.0,
+            last_updated_at: None,
+        },
+    );
+    let defaults = AgentHints {
+        osl: 9,
+        iat: 12,
+        priority: 0,
+        latency_sensitivity: 2.0,
+        prefix_id: "defaults".into(),
+        total_requests: 11,
+    };
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: Some(defaults),
+        dag_cpm: Some(dag_cpm),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+
+    let (request, _) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        None,
+    )
+    .unwrap();
+
+    let body_hints = &request.content["nvext"]["agent_hints"];
+    assert_eq!(body_hints["priority"], serde_json::json!(3));
+    assert_eq!(body_hints["osl"], serde_json::json!(9));
+    assert_eq!(body_hints["prefix_id"], serde_json::json!("defaults"));
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_emits_priority_only_from_dag_cpm() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let mut dag_cpm = DagCpmState::new("fallback-agent");
+    dag_cpm.nodes.insert(
+        "root/llm:model".to_string(),
+        DagCpmNodeState {
+            observation_count: 1,
+            duration_ms_ewma: 1000.0,
+            slack_ms_ewma: 1500.0,
+            criticality_ewma: 0.5,
+            queue_horizon_ms_ewma: 3000.0,
+            last_updated_at: None,
+        },
+    );
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: Some(dag_cpm),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+
+    let (request, _) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        None,
+    )
+    .unwrap();
+
+    let body_hints = &request.content["nvext"]["agent_hints"];
+    assert_eq!(body_hints["priority"], serde_json::json!(2));
+    assert_eq!(body_hints["osl"], serde_json::json!(0));
+    assert_eq!(body_hints["iat"], serde_json::json!(0));
+    assert_eq!(
+        body_hints["prefix_id"],
+        serde_json::json!("fallback-agent-d0")
+    );
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_uses_workflow_class_priority_cap() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let stack_handle = current_scope_stack();
+    let mut stack = stack_handle.write().unwrap();
+    stack.top_mut().metadata = Some(serde_json::json!({
+        "nemo_flow_adaptive": {
+            "scheduling_class": "interactive",
+        }
+    }));
+    drop(stack);
+
+    let mut dag_cpm = DagCpmState::new("fallback-agent");
+    dag_cpm.nodes.insert(
+        "root/llm:model".to_string(),
+        DagCpmNodeState {
+            observation_count: 3,
+            duration_ms_ewma: 1000.0,
+            slack_ms_ewma: 0.0,
+            criticality_ewma: 1.0,
+            queue_horizon_ms_ewma: 3000.0,
+            last_updated_at: None,
+        },
+    );
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: Some(dag_cpm),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+
+    let (request, _) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        request.content["nvext"]["agent_hints"]["priority"],
+        serde_json::json!(5)
+    );
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_uses_join_fallback_without_matching_dag_cpm_node() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: Some(DagCpmState::new("fallback-agent")),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+    let annotated = annotated_with_messages(vec![Message::Tool {
+        content: MessageContent::Text("tool result".into()),
+        tool_call_id: "call-1".into(),
+    }]);
+
+    let (request, _) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        Some(annotated),
+    )
+    .unwrap();
+
+    let body_hints = &request.content["nvext"]["agent_hints"];
+    assert_eq!(body_hints["priority"], serde_json::json!(2));
+    assert_eq!(body_hints["osl"], serde_json::json!(0));
+    assert_eq!(
+        body_hints["prefix_id"],
+        serde_json::json!("fallback-agent-d0")
+    );
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_caps_join_fallback_for_background_workflow() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let stack_handle = current_scope_stack();
+    let mut stack = stack_handle.write().unwrap();
+    stack.top_mut().metadata = Some(serde_json::json!({
+        "nemo_flow_adaptive": {
+            "workflow_class": "background",
+        }
+    }));
+    drop(stack);
+
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: Some(DagCpmState::new("fallback-agent")),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+    let annotated = annotated_with_messages(vec![Message::Tool {
+        content: MessageContent::Text("tool result".into()),
+        tool_call_id: "call-1".into(),
+    }]);
+
+    let (request, _) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        Some(annotated),
+    )
+    .unwrap();
+
+    assert_eq!(
+        request.content["nvext"]["agent_hints"]["priority"],
+        serde_json::json!(1)
+    );
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_uses_small_root_fallback_without_matching_dag_cpm_node() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: Some(DagCpmState::new("fallback-agent")),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+
+    let (request, _) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        request.content["nvext"]["agent_hints"]["priority"],
+        serde_json::json!(1)
     );
 
     reset_root_metadata();

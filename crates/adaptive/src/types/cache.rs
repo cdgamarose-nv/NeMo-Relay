@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dag::DagCpmState;
 use crate::types::metadata::AgentHints;
 use crate::types::plan::ExecutionPlan;
 
@@ -24,6 +25,9 @@ pub struct HotCache {
     pub trie: Option<crate::trie::data_models::PredictionTrieNode>,
     /// Default agent-level hints computed from the prediction trie.
     pub agent_hints_default: Option<AgentHints>,
+    /// Learned DAG CPM aggregates used for hot-path priority projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dag_cpm: Option<DagCpmState>,
     /// Per-profile ACG stability results keyed by derived profile identifier.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub acg_profiles: HashMap<String, crate::acg::stability::StabilityAnalysisResult>,

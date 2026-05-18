@@ -14,16 +14,23 @@ use std::sync::{Arc, RwLock};
 
 use nemo_flow::api::llm::LlmRequest;
 use nemo_flow::api::runtime::LlmRequestInterceptFn;
-use nemo_flow::codec::request::AnnotatedLlmRequest;
+use nemo_flow::codec::request::{AnnotatedLlmRequest, Message};
 
 use crate::context_helpers::{
-    extract_scope_path, read_manual_latency_sensitivity, resolve_agent_id,
+    WorkflowClass, extract_scope_path, read_manual_latency_sensitivity, read_workflow_class,
+    resolve_agent_id,
+};
+use crate::dag::{
+    DEFAULT_DAG_PRIORITY_CAP, DagCpmState, MAX_DAG_PRIORITY_CAP, llm_structural_key,
+    project_priority_prior,
 };
 use crate::intercepts::AGENT_HINTS_HEADER_KEY;
 use crate::trie::builder::SensitivityConfig;
 use crate::trie::lookup::PredictionTrieLookup;
 use crate::types::cache::HotCache;
 use crate::types::metadata::AgentHints;
+
+const DEFAULT_PRIORITY_ADJUSTMENT: i32 = 0;
 
 /// Builds [`AgentHints`] from a trie prediction and optional default hints.
 ///
@@ -74,6 +81,92 @@ fn apply_manual_latency_override(
     }
 }
 
+fn apply_dag_priority_prior(
+    hints: Option<AgentHints>,
+    dag_cpm: Option<&DagCpmState>,
+    structural_key: &str,
+    effective_agent_id: &str,
+    scope_depth: usize,
+    priority_cap: u32,
+    fallback_priority: Option<u32>,
+) -> Option<AgentHints> {
+    let learned_priority = dag_cpm
+        .and_then(|state| state.nodes.get(structural_key))
+        .and_then(|node| project_priority_prior(node, DEFAULT_PRIORITY_ADJUSTMENT, priority_cap));
+
+    match (hints, learned_priority, fallback_priority) {
+        (Some(mut hints), Some(priority), _) => {
+            hints.priority = priority as i32;
+            Some(hints)
+        }
+        (None, Some(priority), _) => Some(priority_only_agent_hints(
+            priority,
+            effective_agent_id,
+            scope_depth,
+        )),
+        (Some(mut hints), None, Some(priority)) => {
+            hints.priority = hints.priority.max(priority as i32);
+            Some(hints)
+        }
+        (None, None, Some(priority)) => Some(priority_only_agent_hints(
+            priority,
+            effective_agent_id,
+            scope_depth,
+        )),
+        (hints, None, None) => hints,
+    }
+}
+
+fn priority_only_agent_hints(
+    priority: u32,
+    effective_agent_id: &str,
+    scope_depth: usize,
+) -> AgentHints {
+    AgentHints {
+        osl: 0,
+        iat: 0,
+        priority: priority as i32,
+        latency_sensitivity: 0.0,
+        prefix_id: format!("{effective_agent_id}-d{scope_depth}"),
+        total_requests: 0,
+    }
+}
+
+fn priority_cap_for_workflow_class(workflow_class: Option<WorkflowClass>) -> u32 {
+    match workflow_class {
+        Some(WorkflowClass::Background) => 1,
+        Some(WorkflowClass::Interactive) => MAX_DAG_PRIORITY_CAP,
+        Some(WorkflowClass::Standard) | None => DEFAULT_DAG_PRIORITY_CAP,
+    }
+}
+
+fn fallback_priority_prior(
+    annotated: Option<&AnnotatedLlmRequest>,
+    call_index: u32,
+    scope_depth: usize,
+    priority_cap: u32,
+) -> Option<u32> {
+    if priority_cap == 0 {
+        return None;
+    }
+
+    if request_ends_with_tool_result(annotated) {
+        return Some(priority_cap.min(2));
+    }
+
+    if call_index == 1 || scope_depth == 0 {
+        return Some(priority_cap.min(1));
+    }
+
+    None
+}
+
+fn request_ends_with_tool_result(annotated: Option<&AnnotatedLlmRequest>) -> bool {
+    annotated
+        .and_then(|request| request.messages.last())
+        .is_some_and(|message| matches!(message, Message::Tool { .. }))
+}
+
 fn manual_agent_hints(manual: u32, effective_agent_id: &str, scope_depth: usize) -> AgentHints {
     let scale = SensitivityConfig::default().sensitivity_scale;
     AgentHints {
@@ -112,7 +205,7 @@ fn inject_agent_hints(request: &mut LlmRequest, hints: &AgentHints) {
 }
 
 /// Opt-in LLM request intercept that injects [`AgentHints`] into request
-/// headers from the prediction trie in [`HotCache`].
+/// headers from the adaptive state in [`HotCache`].
 ///
 /// Constructed via [`AdaptiveHintsIntercept::new`] and converted to an
 /// [`LlmRequestInterceptFn`] via [`AdaptiveHintsIntercept::into_request_fn`] for
@@ -139,16 +232,19 @@ impl AdaptiveHintsIntercept {
 
     fn load_hints(
         &self,
+        llm_name: &str,
         scope_path: &[String],
         effective_agent_id: &str,
         call_index: u32,
         scope_depth: usize,
+        priority_cap: u32,
+        annotated: Option<&AnnotatedLlmRequest>,
     ) -> Option<AgentHints> {
         let Ok(cache_guard) = self.hot_cache.read() else {
             return None;
         };
 
-        if let Some(ref trie) = cache_guard.trie {
+        let trie_hints = if let Some(ref trie) = cache_guard.trie {
             let lookup = PredictionTrieLookup::new(trie);
             let prediction = lookup.find(scope_path, call_index);
             build_agent_hints(
@@ -160,27 +256,49 @@ impl AdaptiveHintsIntercept {
             )
         } else {
             cache_guard.agent_hints_default.clone()
-        }
+        };
+
+        let structural_key = llm_structural_key(scope_path, llm_name);
+        let fallback_priority = cache_guard.dag_cpm.as_ref().and_then(|_| {
+            fallback_priority_prior(annotated, call_index, scope_depth, priority_cap)
+        });
+        apply_dag_priority_prior(
+            trie_hints,
+            cache_guard.dag_cpm.as_ref(),
+            &structural_key,
+            effective_agent_id,
+            scope_depth,
+            priority_cap,
+            fallback_priority,
+        )
     }
 
     /// Converts this intercept into an [`LlmRequestInterceptFn`] suitable for
     /// registration with [`register_llm_request_intercept`].
     ///
-    /// The returned closure reads the HotCache trie, builds AgentHints,
-    /// injects them into the request headers and body, and returns the
-    /// transformed request.
+    /// The returned closure reads HotCache hints, projects DAG CPM priority when
+    /// available, injects AgentHints into the request headers and body, and
+    /// returns the transformed request.
     pub fn into_request_fn(self) -> LlmRequestInterceptFn {
         let this = Arc::new(self);
         Box::new(
-            move |_name: &str, mut request: LlmRequest, annotated: Option<AnnotatedLlmRequest>| {
+            move |name: &str, mut request: LlmRequest, annotated: Option<AnnotatedLlmRequest>| {
                 let scope_path = extract_scope_path();
                 let manual_ls = read_manual_latency_sensitivity();
+                let priority_cap = priority_cap_for_workflow_class(read_workflow_class());
                 let scope_depth = scope_path.len();
                 let call_index = this.call_counter.fetch_add(1, Ordering::Relaxed);
 
                 let effective_agent_id = this.effective_agent_id();
-                let cached_hints =
-                    this.load_hints(&scope_path, &effective_agent_id, call_index, scope_depth);
+                let cached_hints = this.load_hints(
+                    name,
+                    &scope_path,
+                    &effective_agent_id,
+                    call_index,
+                    scope_depth,
+                    priority_cap,
+                    annotated.as_ref(),
+                );
                 let final_hints = apply_manual_latency_override(
                     cached_hints,
                     manual_ls,

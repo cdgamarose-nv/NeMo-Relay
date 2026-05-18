@@ -69,6 +69,7 @@ fn make_hot_cache(stable_prefix_length: Option<usize>) -> HotCache {
         plan: None,
         trie: None,
         agent_hints_default: None,
+        dag_cpm: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: stable_prefix_length.map(|stable_prefix_length| StabilityAnalysisResult {

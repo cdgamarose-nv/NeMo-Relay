@@ -62,6 +62,43 @@ fn test_set_latency_sensitivity_read_roundtrip() {
 }
 
 #[test]
+fn test_read_workflow_class_reads_nearest_scope_metadata() {
+    let stack_handle = current_scope_stack();
+    let mut stack = stack_handle.write().unwrap();
+    stack.top_mut().metadata = Some(serde_json::json!({
+        "nemo_flow_adaptive": {
+            "workflow_class": "standard",
+        }
+    }));
+    drop(stack);
+    assert_eq!(read_workflow_class(), Some(WorkflowClass::Standard));
+
+    let function_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("branch")
+            .scope_type(ScopeType::Function)
+            .metadata(serde_json::json!({
+                "nemo_flow_adaptive": {
+                    "scheduling_class": "background",
+                }
+            }))
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(read_workflow_class(), Some(WorkflowClass::Background));
+
+    nemo_flow::api::scope::pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&function_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    let stack_handle = current_scope_stack();
+    let mut stack = stack_handle.write().unwrap();
+    stack.top_mut().metadata = None;
+}
+
+#[test]
 fn test_helpers_return_defaults_when_scope_stack_lock_is_poisoned() {
     let poisoned = create_scope_stack();
     let poisoned_for_panic = poisoned.clone();
@@ -73,6 +110,7 @@ fn test_helpers_return_defaults_when_scope_stack_lock_is_poisoned() {
     set_thread_scope_stack(poisoned);
     assert!(extract_scope_path().is_empty());
     assert_eq!(read_manual_latency_sensitivity(), None);
+    assert_eq!(read_workflow_class(), None);
     assert_eq!(resolve_agent_id(), None);
 
     set_thread_scope_stack(create_scope_stack());

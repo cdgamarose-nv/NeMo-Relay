@@ -108,6 +108,25 @@ fn test_event_to_call_record_tool_start() {
 }
 
 #[test]
+fn test_event_to_call_record_tool_start_captures_tool_call_id() {
+    let event = Event::Scope(ScopeEvent::new(
+        BaseEvent::builder().name("search").build(),
+        ScopeCategory::Start,
+        Vec::new(),
+        EventCategory::tool(),
+        Some(
+            CategoryProfile::builder()
+                .tool_call_id("call-search")
+                .build(),
+        ),
+    ));
+    let record =
+        event_to_call_record(&event, &[]).expect("should produce CallRecord for Tool start");
+
+    assert_eq!(record.tool_call_id.as_deref(), Some("call-search"));
+}
+
+#[test]
 fn test_event_to_call_record_end_event_returns_none() {
     let event = make_test_event(EventType::End, Some(ScopeType::Llm), Some("gpt-4"));
     assert!(

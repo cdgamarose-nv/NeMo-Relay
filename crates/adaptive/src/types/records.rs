@@ -115,6 +115,9 @@ pub struct CallRecord {
     /// Number of tool calls issued by the provider, when available.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_call_count: Option<u32>,
+    /// Provider tool-call correlation identifier for tool calls, when available.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_call_id: Option<String>,
     /// Annotated request captured for Adaptive Cache Governor (ACG) analysis,
     /// when available.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -157,6 +160,7 @@ impl Default for CallRecord {
             total_tokens: None,
             model_name: None,
             tool_call_count: None,
+            tool_call_id: None,
             annotated_request: None,
             annotated_response: None,
             function_path: vec![],

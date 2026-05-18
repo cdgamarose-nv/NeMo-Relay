@@ -38,7 +38,7 @@ use crate::config::{
     ToolParallelismComponentConfig,
 };
 use crate::context_helpers::resolve_agent_id;
-use crate::dag::DagCpmLearner;
+use crate::dag::{DagCpmLearner, DagCpmState};
 use crate::error::{AdaptiveError, Result};
 use crate::intercepts::create_tool_execution_intercept_with_mode;
 use crate::learner::latency::LatencySensitivityLearner;
@@ -145,7 +145,9 @@ impl<'a> RegistrationContext<'a> {
             .map_err(Into::into)
     }
 
-    fn take_event_receiver(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<(Event, Vec<String>)>> {
+    fn take_event_receiver(
+        &mut self,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<(Event, Vec<String>)>> {
         self.runtime
             .event_rx
             .take()
@@ -209,6 +211,7 @@ impl AdaptiveRuntime {
                 plan: None,
                 trie: None,
                 agent_hints_default: None,
+                dag_cpm: None,
                 acg_profiles: std::collections::HashMap::new(),
                 acg_profile_observation_counts: std::collections::HashMap::new(),
                 acg_stability: None,
@@ -389,7 +392,13 @@ impl AdaptiveRuntime {
 
         let agent_id = self.agent_id();
         self.registered_agent_id = Some(agent_id.clone());
-        Self::seed_hot_cache(self.backend.clone(), self.hot_cache.clone(), &agent_id).await;
+        Self::seed_hot_cache(
+            self.backend.clone(),
+            self.hot_cache.clone(),
+            &agent_id,
+            self.dag_cpm_enabled(),
+        )
+        .await;
 
         if self.config.acg.is_some()
             && let Some(backend) = self.backend.as_ref()
@@ -421,8 +430,14 @@ impl AdaptiveRuntime {
         backend: Option<Arc<dyn StorageBackendDyn + Send + Sync>>,
         hot_cache: Arc<RwLock<HotCache>>,
         agent_id: &str,
+        seed_empty_dag_cpm: bool,
     ) {
         let Some(backend) = backend else {
+            if seed_empty_dag_cpm
+                && let Ok(mut guard) = hot_cache.write()
+            {
+                guard.dag_cpm = Some(DagCpmState::new(agent_id));
+            }
             return;
         };
 
@@ -434,6 +449,31 @@ impl AdaptiveRuntime {
             }
             Err(error) => eprintln!("nemo-flow-adaptive: hot cache seeding failed: {error}"),
         }
+
+        match backend.load_dag_state(agent_id).await {
+            Ok(dag_cpm) => {
+                if let Ok(mut guard) = hot_cache.write() {
+                    guard.dag_cpm = dag_cpm.or_else(|| {
+                        seed_empty_dag_cpm.then(|| DagCpmState::new(agent_id))
+                    });
+                }
+            }
+            Err(error) => {
+                eprintln!("nemo-flow-adaptive: DAG CPM hot cache seeding failed: {error}");
+                if seed_empty_dag_cpm
+                    && let Ok(mut guard) = hot_cache.write()
+                {
+                    guard.dag_cpm = Some(DagCpmState::new(agent_id));
+                }
+            }
+        }
+    }
+
+    fn dag_cpm_enabled(&self) -> bool {
+        self.config
+            .telemetry
+            .as_ref()
+            .is_some_and(|config| config.learners.iter().any(|learner| learner == "dag_cpm"))
     }
 
     fn pending_features(&self, agent_id: &str) -> Vec<Box<dyn AdaptiveFeature>> {
