@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dag::DagCpmState;
+use crate::osl_empirical::OslEmpiricalState;
 use crate::priority_residual::PriorityResidualState;
 use crate::types::metadata::AgentHints;
 use crate::types::plan::ExecutionPlan;
@@ -32,6 +33,9 @@ pub struct HotCache {
     /// Learned residual correction state for DAG CPM priority hints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_residual: Option<PriorityResidualState>,
+    /// Learned empirical output-token samples for optional OSL hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub osl_empirical: Option<OslEmpiricalState>,
     /// Per-profile ACG stability results keyed by derived profile identifier.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub acg_profiles: HashMap<String, crate::acg::stability::StabilityAnalysisResult>,

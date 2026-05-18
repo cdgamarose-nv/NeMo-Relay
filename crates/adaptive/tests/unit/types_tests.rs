@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::acg::profile::{BlockStabilityScore, StabilityClass};
 use crate::acg::prompt_ir::SpanId;
 use crate::acg::stability::StabilityAnalysisResult;
+use crate::osl_empirical::OslEmpiricalState;
 use crate::trie::data_models::PredictionTrieNode;
 use crate::types::cache::HotCache;
 use crate::types::metadata::{AgentHints, MetadataEnvelope, ParallelHint};
@@ -125,6 +126,7 @@ fn hot_cache_round_trip_preserves_optional_sections() {
         }),
         dag_cpm: None,
         priority_residual: None,
+        osl_empirical: Some(OslEmpiricalState::new("agent-1")),
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -137,6 +139,7 @@ fn hot_cache_round_trip_preserves_optional_sections() {
     assert_eq!(decoded.plan.as_ref().unwrap().agent_id, "agent-1");
     assert_eq!(decoded.trie.as_ref().unwrap().name, "root");
     assert_eq!(decoded.agent_hints_default.as_ref().unwrap().osl, Some(256));
+    assert_eq!(decoded.osl_empirical.as_ref().unwrap().agent_id, "agent-1");
 }
 
 #[test]
@@ -183,6 +186,7 @@ fn hot_cache_serialization_keeps_acg_field_names_stable() {
         agent_hints_default: None,
         dag_cpm: None,
         priority_residual: None,
+        osl_empirical: None,
         acg_profiles: HashMap::from([("profile-a".to_string(), stability.clone())]),
         acg_profile_observation_counts: HashMap::from([("profile-a".to_string(), 4)]),
         acg_stability: Some(stability),

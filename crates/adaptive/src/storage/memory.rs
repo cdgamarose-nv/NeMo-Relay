@@ -10,6 +10,7 @@ use std::sync::RwLock;
 
 use crate::dag::DagCpmState;
 use crate::error::{AdaptiveError, Result};
+use crate::osl_empirical::OslEmpiricalState;
 use crate::priority_residual::PriorityResidualState;
 use crate::storage::traits::{StorageBackend, StorageBackendDyn};
 use crate::trie::accumulator::AccumulatorState;
@@ -28,6 +29,7 @@ pub struct InMemoryBackend {
     accumulators: RwLock<HashMap<String, AccumulatorState>>,
     dag_states: RwLock<HashMap<String, DagCpmState>>,
     priority_residual_states: RwLock<HashMap<String, PriorityResidualState>>,
+    osl_empirical_states: RwLock<HashMap<String, OslEmpiricalState>>,
     observations: RwLock<HashMap<String, Vec<crate::acg::prompt_ir::PromptIR>>>,
     stability: RwLock<HashMap<String, crate::acg::stability::StabilityAnalysisResult>>,
 }
@@ -45,6 +47,7 @@ impl InMemoryBackend {
             accumulators: RwLock::new(HashMap::new()),
             dag_states: RwLock::new(HashMap::new()),
             priority_residual_states: RwLock::new(HashMap::new()),
+            osl_empirical_states: RwLock::new(HashMap::new()),
             observations: RwLock::new(HashMap::new()),
             stability: RwLock::new(HashMap::new()),
         }
@@ -273,6 +276,46 @@ impl StorageBackendDyn for InMemoryBackend {
         let result = {
             let guard = self
                 .priority_residual_states
+                .read()
+                .map_err(|error| AdaptiveError::Internal(format!("lock poisoned: {error}")));
+            match guard {
+                Ok(ref states) => Ok(states.get(agent_id).cloned()),
+                Err(error) => Err(error),
+            }
+        };
+        Box::pin(async move { result })
+    }
+
+    fn store_osl_empirical_state<'a>(
+        &'a self,
+        agent_id: &'a str,
+        state: &'a OslEmpiricalState,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        let result = {
+            let mut guard = self
+                .osl_empirical_states
+                .write()
+                .map_err(|error| AdaptiveError::Internal(format!("lock poisoned: {error}")));
+            match guard {
+                Ok(ref mut states) => {
+                    let mut persisted = state.clone();
+                    persisted.run_contexts.clear();
+                    states.insert(agent_id.to_string(), persisted);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        Box::pin(async move { result })
+    }
+
+    fn load_osl_empirical_state<'a>(
+        &'a self,
+        agent_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<OslEmpiricalState>>> + Send + 'a>> {
+        let result = {
+            let guard = self
+                .osl_empirical_states
                 .read()
                 .map_err(|error| AdaptiveError::Internal(format!("lock poisoned: {error}")));
             match guard {

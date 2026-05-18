@@ -13,6 +13,7 @@ use crate::acg::prompt_ir::{
     BlockContentType, PromptBlock, PromptIR, PromptRole, ProvenanceLabel, SensitivityLabel, SpanId,
 };
 use crate::acg::stability::StabilityAnalysisResult;
+use crate::osl_empirical::OslEmpiricalState;
 use crate::trie::data_models::PredictionTrieNode;
 use crate::types::metadata::MetadataEnvelope;
 use crate::types::records::{CallKind, CallRecord};
@@ -129,6 +130,16 @@ async fn in_memory_backend_reports_lock_poisoning_across_all_storage_maps() {
     );
     assert!(accumulator_backend.load_accumulators("a").await.is_err());
 
+    let osl_backend = InMemoryBackend::new();
+    poison_lock(&osl_backend.osl_empirical_states);
+    assert!(
+        osl_backend
+            .store_osl_empirical_state("a", &OslEmpiricalState::new("a"))
+            .await
+            .is_err()
+    );
+    assert!(osl_backend.load_osl_empirical_state("a").await.is_err());
+
     let observation_backend = InMemoryBackend::new();
     poison_lock(&observation_backend.observations);
     let observations = vec![sample_prompt_ir_record()];
@@ -150,4 +161,30 @@ async fn in_memory_backend_reports_lock_poisoning_across_all_storage_maps() {
             .is_err()
     );
     assert!(stability_backend.load_stability("a").await.is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn in_memory_backend_osl_empirical_state_round_trips() {
+    let backend = InMemoryBackend::new();
+    let mut state = OslEmpiricalState::new("agent-osl");
+    state
+        .contexts
+        .insert("context-a".to_string(), Default::default());
+    state
+        .run_contexts
+        .insert("run-local".to_string(), Default::default());
+
+    backend
+        .store_osl_empirical_state("agent-osl", &state)
+        .await
+        .unwrap();
+
+    let loaded = backend
+        .load_osl_empirical_state("agent-osl")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.agent_id, "agent-osl");
+    assert!(loaded.contexts.contains_key("context-a"));
+    assert!(loaded.run_contexts.is_empty());
 }

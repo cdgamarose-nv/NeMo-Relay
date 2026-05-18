@@ -43,6 +43,7 @@ use crate::error::{AdaptiveError, Result};
 use crate::intercepts::create_tool_execution_intercept_with_mode;
 use crate::learner::latency::LatencySensitivityLearner;
 use crate::learner::traits::Learner;
+use crate::osl_empirical::OslEmpiricalState;
 use crate::priority_residual::{PriorityResidualLearner, PriorityResidualState};
 use crate::runtime::backend::build_backend;
 use crate::runtime::validation::validate_config;
@@ -214,6 +215,7 @@ impl AdaptiveRuntime {
                 agent_hints_default: None,
                 dag_cpm: None,
                 priority_residual: None,
+                osl_empirical: None,
                 acg_profiles: std::collections::HashMap::new(),
                 acg_profile_observation_counts: std::collections::HashMap::new(),
                 acg_stability: None,
@@ -400,6 +402,7 @@ impl AdaptiveRuntime {
             &agent_id,
             self.dag_cpm_enabled(),
             self.priority_residual_enabled(),
+            self.osl_empirical_enabled(),
         )
         .await;
 
@@ -435,9 +438,10 @@ impl AdaptiveRuntime {
         agent_id: &str,
         seed_empty_dag_cpm: bool,
         seed_empty_priority_residual: bool,
+        seed_empty_osl_empirical: bool,
     ) {
         let Some(backend) = backend else {
-            if (seed_empty_dag_cpm || seed_empty_priority_residual)
+            if (seed_empty_dag_cpm || seed_empty_priority_residual || seed_empty_osl_empirical)
                 && let Ok(mut guard) = hot_cache.write()
             {
                 if seed_empty_dag_cpm {
@@ -445,6 +449,9 @@ impl AdaptiveRuntime {
                 }
                 if seed_empty_priority_residual {
                     guard.priority_residual = Some(PriorityResidualState::new(agent_id));
+                }
+                if seed_empty_osl_empirical {
+                    guard.osl_empirical = Some(OslEmpiricalState::new(agent_id));
                 }
             }
             return;
@@ -491,6 +498,22 @@ impl AdaptiveRuntime {
                 }
             }
         }
+
+        match backend.load_osl_empirical_state(agent_id).await {
+            Ok(osl_empirical) => {
+                if let Ok(mut guard) = hot_cache.write() {
+                    guard.osl_empirical = osl_empirical.or_else(|| {
+                        seed_empty_osl_empirical.then(|| OslEmpiricalState::new(agent_id))
+                    });
+                }
+            }
+            Err(error) => {
+                eprintln!("nemo-flow-adaptive: OSL empirical hot cache seeding failed: {error}");
+                if seed_empty_osl_empirical && let Ok(mut guard) = hot_cache.write() {
+                    guard.osl_empirical = Some(OslEmpiricalState::new(agent_id));
+                }
+            }
+        }
     }
 
     fn dag_cpm_enabled(&self) -> bool {
@@ -506,6 +529,15 @@ impl AdaptiveRuntime {
                 .learners
                 .iter()
                 .any(|learner| learner == "priority_residual")
+        })
+    }
+
+    fn osl_empirical_enabled(&self) -> bool {
+        self.config.telemetry.as_ref().is_some_and(|config| {
+            config
+                .learners
+                .iter()
+                .any(|learner| learner == "osl_empirical")
         })
     }
 

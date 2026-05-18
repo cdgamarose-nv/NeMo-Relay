@@ -8,6 +8,7 @@ use std::pin::Pin;
 
 use crate::dag::DagCpmState;
 use crate::error::Result;
+use crate::osl_empirical::OslEmpiricalState;
 use crate::priority_residual::PriorityResidualState;
 use crate::trie::accumulator::AccumulatorState;
 use crate::trie::serialization::TrieEnvelope;
@@ -114,6 +115,29 @@ pub trait StorageBackendDyn: Send + Sync + 'static {
         &'a self,
         _agent_id: &'a str,
     ) -> BoxStorageFuture<'a, Option<PriorityResidualState>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    /// Persist empirical OSL learner state for an agent.
+    ///
+    /// # Notes
+    /// The default implementation is a no-op.
+    fn store_osl_empirical_state<'a>(
+        &'a self,
+        _agent_id: &'a str,
+        _state: &'a OslEmpiricalState,
+    ) -> BoxStorageFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Load empirical OSL learner state for an agent.
+    ///
+    /// # Notes
+    /// The default implementation returns `Ok(None)`.
+    fn load_osl_empirical_state<'a>(
+        &'a self,
+        _agent_id: &'a str,
+    ) -> BoxStorageFuture<'a, Option<OslEmpiricalState>> {
         Box::pin(async move { Ok(None) })
     }
 

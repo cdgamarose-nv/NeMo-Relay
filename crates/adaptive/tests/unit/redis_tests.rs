@@ -8,6 +8,7 @@ use super::*;
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::osl_empirical::OslEmpiricalState;
 use crate::storage::traits::{StorageBackend, StorageBackendDyn};
 use crate::trie::accumulator::AccumulatorState;
 use crate::trie::data_models::PredictionTrieNode;
@@ -206,6 +207,34 @@ async fn redis_backend_trie_and_accumulators_round_trip_and_report_invalid_json(
         .unwrap();
     let accum_err = backend.load_accumulators("agent-state").await.unwrap_err();
     assert!(matches!(accum_err, AdaptiveError::Serialization(_)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redis_backend_osl_empirical_state_round_trips() {
+    let Some(backend) = get_test_redis().await else {
+        return;
+    };
+    let mut state = OslEmpiricalState::new("agent-osl");
+    state
+        .contexts
+        .insert("context-a".to_string(), Default::default());
+    state
+        .run_contexts
+        .insert("run-local".to_string(), Default::default());
+
+    backend
+        .store_osl_empirical_state("agent-osl", &state)
+        .await
+        .unwrap();
+
+    let loaded = backend
+        .load_osl_empirical_state("agent-osl")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.agent_id, "agent-osl");
+    assert!(loaded.contexts.contains_key("context-a"));
+    assert!(loaded.run_contexts.is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

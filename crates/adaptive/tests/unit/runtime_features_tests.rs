@@ -271,6 +271,7 @@ async fn adaptive_hints_feature_registers_request_intercept() {
         }),
         dag_cpm: None,
         priority_residual: None,
+        osl_empirical: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -334,6 +335,7 @@ async fn tool_parallelism_feature_registers_execution_intercept() {
         agent_hints_default: None,
         dag_cpm: None,
         priority_residual: None,
+        osl_empirical: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -405,6 +407,7 @@ async fn adaptive_runtime_register_survives_hot_cache_seed_failures() {
             agent_hints_default: None,
             dag_cpm: None,
             priority_residual: None,
+            osl_empirical: None,
             acg_profiles: std::collections::HashMap::new(),
             acg_profile_observation_counts: std::collections::HashMap::new(),
             acg_stability: None,
@@ -451,6 +454,42 @@ async fn adaptive_runtime_seeds_empty_dag_cpm_when_learner_is_enabled() {
     let dag_cpm = runtime.hot_cache.read().unwrap().dag_cpm.as_ref().cloned();
     assert!(dag_cpm.is_some());
     assert!(dag_cpm.unwrap().nodes.is_empty());
+
+    runtime.deregister().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn adaptive_runtime_seeds_empty_osl_empirical_when_learner_is_enabled() {
+    let _lock = TEST_MUTEX.lock().await;
+    reset_global();
+
+    let mut runtime = AdaptiveRuntime::new(AdaptiveConfig {
+        agent_id: Some("agent-osl".to_string()),
+        state: Some(StateConfig {
+            backend: BackendSpec::in_memory(),
+        }),
+        telemetry: Some(TelemetryComponentConfig {
+            subscriber_name: None,
+            learners: vec!["osl_empirical".to_string()],
+        }),
+        ..AdaptiveConfig::default()
+    })
+    .await
+    .unwrap();
+
+    runtime.register().await.unwrap();
+
+    let state = runtime
+        .hot_cache
+        .read()
+        .unwrap()
+        .osl_empirical
+        .as_ref()
+        .cloned();
+    let state = state.expect("OSL empirical state should be seeded");
+    assert_eq!(state.agent_id, "agent-osl");
+    assert!(state.contexts.is_empty());
+    assert!(state.run_contexts.is_empty());
 
     runtime.deregister().unwrap();
 }
