@@ -1,13 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
+
+use chrono::{TimeZone, Utc};
 use nemo_flow::codec::request::{
     AnnotatedLlmRequest, FunctionDefinition, Message, MessageContent, ToolDefinition,
 };
 use uuid::Uuid;
 
 use super::{
-    OslContextKey, OslContextScope, OslEmpiricalState, OslMessageRole, OslRequestSignature,
+    OSL_MAX_SPREAD_MULTIPLIER, OslContextKey, OslContextScope, OslContextStats, OslEmpiricalState,
+    OslMessageRole, OslRequestSignature,
 };
 
 fn request(messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> AnnotatedLlmRequest {
@@ -171,4 +175,88 @@ fn empirical_state_does_not_persist_run_contexts() {
     let decoded: OslEmpiricalState = serde_json::from_value(encoded).unwrap();
     assert!(decoded.contexts.contains_key("persistent"));
     assert!(decoded.run_contexts.is_empty());
+}
+
+#[test]
+fn nearest_rank_quantile_uses_exact_integer_rank() {
+    let stats = OslContextStats {
+        samples: VecDeque::from([10, 20, 30, 40, 50, 60, 70, 80, 90, 100]),
+        last_updated_at: None,
+    };
+
+    assert_eq!(stats.nearest_rank_quantile(50), Some(50));
+    assert_eq!(stats.nearest_rank_quantile(85), Some(90));
+    assert_eq!(stats.nearest_rank_quantile(90), Some(90));
+    assert_eq!(stats.nearest_rank_quantile(100), Some(100));
+    assert_eq!(stats.nearest_rank_quantile(0), None);
+    assert_eq!(stats.nearest_rank_quantile(101), None);
+}
+
+#[test]
+fn confidence_requires_min_samples() {
+    let stats = OslContextStats {
+        samples: VecDeque::from([100, 100, 100]),
+        last_updated_at: None,
+    };
+
+    assert!(!stats.is_confident(4));
+    assert!(stats.is_confident(3));
+}
+
+#[test]
+fn confidence_uses_exact_p90_p50_spread_boundary() {
+    let passing = OslContextStats {
+        samples: VecDeque::from([10, 10, 10, 10, 10, 10, 10, 10, 40, 40]),
+        last_updated_at: None,
+    };
+    let failing = OslContextStats {
+        samples: VecDeque::from([10, 10, 10, 10, 10, 10, 10, 10, 41, 41]),
+        last_updated_at: None,
+    };
+
+    assert_eq!(OSL_MAX_SPREAD_MULTIPLIER, 4);
+    assert!(passing.is_confident(10));
+    assert!(!failing.is_confident(10));
+}
+
+#[test]
+fn predict_p85_requires_confidence() {
+    let confident = OslContextStats {
+        samples: VecDeque::from([10, 20, 30, 40, 50, 60, 70, 80, 90, 100]),
+        last_updated_at: None,
+    };
+    let unstable = OslContextStats {
+        samples: VecDeque::from([1, 1, 1, 1, 1, 1, 1, 1, 100, 100]),
+        last_updated_at: None,
+    };
+
+    assert_eq!(confident.predict_p85(10), Some(90));
+    assert_eq!(unstable.predict_p85(10), None);
+}
+
+#[test]
+fn observe_records_time_and_evicts_oldest_samples() {
+    let mut stats = OslContextStats::default();
+    let first = Utc.timestamp_millis_opt(1000).single().unwrap();
+    let second = Utc.timestamp_millis_opt(2000).single().unwrap();
+    let third = Utc.timestamp_millis_opt(3000).single().unwrap();
+
+    stats.observe_with_limit(10, first, 2);
+    stats.observe_with_limit(20, second, 2);
+    stats.observe_with_limit(30, third, 2);
+
+    assert_eq!(stats.sample_count(), 2);
+    assert_eq!(stats.samples, VecDeque::from([20, 30]));
+    assert_eq!(stats.last_updated_at, Some(third));
+}
+
+#[test]
+fn observe_with_zero_limit_retains_no_samples() {
+    let mut stats = OslContextStats::default();
+    let observed_at = Utc.timestamp_millis_opt(1000).single().unwrap();
+
+    stats.observe_with_limit(10, observed_at, 0);
+
+    assert_eq!(stats.sample_count(), 0);
+    assert_eq!(stats.last_updated_at, Some(observed_at));
 }

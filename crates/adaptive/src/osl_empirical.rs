@@ -10,6 +10,21 @@ use nemo_flow::codec::request::{AnnotatedLlmRequest, Message};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Maximum retained output-token samples per empirical OSL context.
+pub const MAX_SAMPLES_PER_CONTEXT: usize = 128;
+/// Minimum samples before run-local empirical OSL can emit.
+pub const RUN_MIN_SAMPLES: usize = 3;
+/// Minimum samples before persistent empirical OSL can emit.
+pub const PERSISTENT_MIN_SAMPLES: usize = 10;
+/// Percentile used for emitted empirical OSL predictions.
+pub const OSL_PREDICTION_PERCENTILE: u32 = 85;
+/// Lower percentile used for spread confidence.
+pub const OSL_SPREAD_LOW_PERCENTILE: u32 = 50;
+/// Upper percentile used for spread confidence.
+pub const OSL_SPREAD_HIGH_PERCENTILE: u32 = 90;
+/// Maximum allowed ratio between p90 and p50, represented as an integer multiplier.
+pub const OSL_MAX_SPREAD_MULTIPLIER: u32 = 4;
+
 /// Message role used in the empirical OSL request signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +192,88 @@ pub struct OslContextStats {
     /// Last observation timestamp for pruning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_updated_at: Option<DateTime<Utc>>,
+}
+
+impl OslContextStats {
+    /// Record one exact observed output-token sample using the default retention limit.
+    pub fn observe(&mut self, output_tokens: u32, observed_at: DateTime<Utc>) {
+        self.observe_with_limit(output_tokens, observed_at, MAX_SAMPLES_PER_CONTEXT);
+    }
+
+    /// Record one exact observed output-token sample using a caller-provided retention limit.
+    pub fn observe_with_limit(
+        &mut self,
+        output_tokens: u32,
+        observed_at: DateTime<Utc>,
+        max_samples: usize,
+    ) {
+        self.last_updated_at = Some(observed_at);
+        if max_samples == 0 {
+            self.samples.clear();
+            return;
+        }
+
+        self.samples.push_back(output_tokens);
+        while self.samples.len() > max_samples {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Return the number of retained samples.
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Compute the nearest-rank empirical quantile over retained samples.
+    ///
+    /// Returns `None` for empty samples or percentiles outside `1..=100`.
+    pub fn nearest_rank_quantile(&self, percentile: u32) -> Option<u32> {
+        nearest_rank_quantile(self.samples.iter().copied(), percentile)
+    }
+
+    /// Whether retained samples are sufficient and stable enough for OSL emission.
+    pub fn is_confident(&self, min_samples: usize) -> bool {
+        if self.samples.len() < min_samples {
+            return false;
+        }
+
+        let Some(p50) = self.nearest_rank_quantile(OSL_SPREAD_LOW_PERCENTILE) else {
+            return false;
+        };
+        let Some(p90) = self.nearest_rank_quantile(OSL_SPREAD_HIGH_PERCENTILE) else {
+            return false;
+        };
+
+        u64::from(p90) <= u64::from(OSL_MAX_SPREAD_MULTIPLIER) * u64::from(p50.max(1))
+    }
+
+    /// Return the p85 empirical OSL prediction when confidence passes.
+    pub fn predict_p85(&self, min_samples: usize) -> Option<u32> {
+        self.is_confident(min_samples).then(|| {
+            self.nearest_rank_quantile(OSL_PREDICTION_PERCENTILE)
+                .expect("confidence requires non-empty samples")
+        })
+    }
+}
+
+fn nearest_rank_quantile<I>(samples: I, percentile: u32) -> Option<u32>
+where
+    I: IntoIterator<Item = u32>,
+{
+    if !(1..=100).contains(&percentile) {
+        return None;
+    }
+
+    let mut sorted: Vec<u32> = samples.into_iter().collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_unstable();
+
+    let n = sorted.len();
+    let rank = ((u128::from(percentile) * n as u128) + 99) / 100;
+    let index = usize::try_from(rank - 1).ok()?;
+    sorted.get(index).copied()
 }
 
 /// Empirical OSL learner state.
