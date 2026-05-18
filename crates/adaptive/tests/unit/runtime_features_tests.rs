@@ -262,7 +262,7 @@ async fn adaptive_hints_feature_registers_request_intercept() {
         plan: None,
         trie: None,
         agent_hints_default: Some(AgentHints {
-            osl: 10,
+            osl: Some(10),
             iat: 20,
             priority: 3,
             latency_sensitivity: 2.0,

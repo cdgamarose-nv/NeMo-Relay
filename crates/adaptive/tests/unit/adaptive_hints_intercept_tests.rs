@@ -87,7 +87,7 @@ fn test_build_agent_hints_from_prediction() {
     let pred = make_prediction(Some(4));
 
     let hints = build_agent_hints(Some(&pred), &None, "test-agent", 2, 3).unwrap();
-    assert_eq!(hints.osl, 150, "osl = output_tokens.p90");
+    assert_eq!(hints.osl, Some(150), "osl = output_tokens.p90");
     assert_eq!(hints.iat, 200, "iat = interarrival_ms.mean");
     assert_eq!(hints.priority, 1, "priority = 5 - 4 = 1");
     assert!((hints.latency_sensitivity - 4.0).abs() < f64::EPSILON);
@@ -98,7 +98,7 @@ fn test_build_agent_hints_from_prediction() {
 #[test]
 fn test_build_agent_hints_falls_back_to_defaults() {
     let defaults = AgentHints {
-        osl: 42,
+        osl: Some(42),
         iat: 99,
         priority: 1,
         latency_sensitivity: 4.0,
@@ -106,7 +106,7 @@ fn test_build_agent_hints_falls_back_to_defaults() {
         total_requests: 10,
     };
     let hints = build_agent_hints(None, &Some(defaults.clone()), "agent", 1, 0).unwrap();
-    assert_eq!(hints.osl, 42);
+    assert_eq!(hints.osl, Some(42));
     assert_eq!(hints.prefix_id, "fallback");
 }
 
@@ -275,7 +275,7 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
     reset_root_metadata();
 
     let defaults = AgentHints {
-        osl: 9,
+        osl: Some(9),
         iat: 12,
         priority: 3,
         latency_sensitivity: 2.0,
@@ -375,7 +375,7 @@ fn test_adaptive_hints_intercept_overrides_cached_priority_from_dag_cpm() {
         },
     );
     let defaults = AgentHints {
-        osl: 9,
+        osl: Some(9),
         iat: 12,
         priority: 0,
         latency_sensitivity: 2.0,
@@ -457,7 +457,7 @@ fn test_adaptive_hints_intercept_emits_priority_only_from_dag_cpm() {
 
     let body_hints = &request.content["nvext"]["agent_hints"];
     assert_eq!(body_hints["priority"], serde_json::json!(2));
-    assert_eq!(body_hints["osl"], serde_json::json!(0));
+    assert!(body_hints.get("osl").is_none());
     assert_eq!(body_hints["iat"], serde_json::json!(0));
     assert_eq!(
         body_hints["prefix_id"],
@@ -655,7 +655,7 @@ fn test_adaptive_hints_intercept_uses_join_fallback_without_matching_dag_cpm_nod
 
     let body_hints = &request.content["nvext"]["agent_hints"];
     assert_eq!(body_hints["priority"], serde_json::json!(2));
-    assert_eq!(body_hints["osl"], serde_json::json!(0));
+    assert!(body_hints.get("osl").is_none());
     assert_eq!(
         body_hints["prefix_id"],
         serde_json::json!("fallback-agent-d0")
@@ -754,7 +754,7 @@ fn test_adaptive_hints_intercept_uses_small_root_fallback_without_matching_dag_c
 #[test]
 fn test_apply_manual_latency_override_and_inject_agent_hints_cover_manual_paths() {
     let base_hints = AgentHints {
-        osl: 10,
+        osl: Some(10),
         iat: 20,
         priority: 3,
         latency_sensitivity: 3.0,
@@ -767,7 +767,7 @@ fn test_apply_manual_latency_override_and_inject_agent_hints_cover_manual_paths(
     assert_eq!(unchanged.latency_sensitivity, 3.0);
 
     let manual_only = apply_manual_latency_override(None, Some(5), "agent", 2).unwrap();
-    assert_eq!(manual_only.osl, 0);
+    assert_eq!(manual_only.osl, None);
     assert_eq!(manual_only.iat, 0);
     assert_eq!(manual_only.latency_sensitivity, 5.0);
     assert_eq!(manual_only.prefix_id, "agent-d2");

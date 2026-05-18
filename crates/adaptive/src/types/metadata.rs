@@ -43,7 +43,8 @@ pub struct ParallelHint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentHints {
     /// Output-size limit hint in tokens.
-    pub osl: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub osl: Option<u32>,
     /// Inter-arrival-time hint in milliseconds.
     pub iat: u32,
     /// Scheduling priority hint derived from latency sensitivity.

@@ -94,7 +94,7 @@ pub fn compute_default_hints(
     let priority = (sensitivity_scale as i32 - latency_sensitivity as i32).max(0);
 
     Some(AgentHints {
-        osl: prediction.output_tokens.p90.round() as u32,
+        osl: Some(prediction.output_tokens.p90.round() as u32),
         iat: prediction.interarrival_ms.mean.round() as u32,
         priority,
         latency_sensitivity: if prediction.latency_sensitivity.is_some() {

@@ -116,7 +116,7 @@ fn hot_cache_round_trip_preserves_optional_sections() {
         }),
         trie: Some(PredictionTrieNode::new("root")),
         agent_hints_default: Some(AgentHints {
-            osl: 256,
+            osl: Some(256),
             iat: 75,
             priority: 3,
             latency_sensitivity: 2.0,
@@ -136,7 +136,7 @@ fn hot_cache_round_trip_preserves_optional_sections() {
 
     assert_eq!(decoded.plan.as_ref().unwrap().agent_id, "agent-1");
     assert_eq!(decoded.trie.as_ref().unwrap().name, "root");
-    assert_eq!(decoded.agent_hints_default.as_ref().unwrap().osl, 256);
+    assert_eq!(decoded.agent_hints_default.as_ref().unwrap().osl, Some(256));
 }
 
 #[test]

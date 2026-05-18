@@ -97,7 +97,7 @@ fn compute_default_hints_maps_prediction_metrics_to_agent_hints() {
     };
 
     let hints = compute_default_hints(&trie_root, 5).unwrap();
-    assert_eq!(hints.osl, 256);
+    assert_eq!(hints.osl, Some(256));
     assert_eq!(hints.iat, 75);
     assert_eq!(hints.priority, 3);
     assert_eq!(hints.latency_sensitivity, 2.0);
@@ -144,7 +144,7 @@ fn compute_default_hints_uses_zero_latency_when_prediction_lacks_sensitivity() {
     };
 
     let hints = compute_default_hints(&trie_root, 5).unwrap();
-    assert_eq!(hints.osl, 42);
+    assert_eq!(hints.osl, Some(42));
     assert_eq!(hints.iat, 12);
     assert_eq!(hints.priority, 4);
     assert_eq!(hints.latency_sensitivity, 0.0);

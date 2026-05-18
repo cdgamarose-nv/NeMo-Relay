@@ -55,7 +55,7 @@ pub(crate) fn build_agent_hints(
         let scale = SensitivityConfig::default().sensitivity_scale;
         let ls = pred.latency_sensitivity.unwrap_or(1);
         Some(AgentHints {
-            osl: pred.output_tokens.p90.round() as u32,
+            osl: Some(pred.output_tokens.p90.round() as u32),
             iat: pred.interarrival_ms.mean.round() as u32,
             priority: (scale as i32 - ls as i32).max(0),
             latency_sensitivity: ls as f64,
@@ -193,7 +193,7 @@ fn priority_only_agent_hints(
     scope_depth: usize,
 ) -> AgentHints {
     AgentHints {
-        osl: 0,
+        osl: None,
         iat: 0,
         priority: priority as i32,
         latency_sensitivity: 0.0,
@@ -240,7 +240,7 @@ fn request_ends_with_tool_result(annotated: Option<&AnnotatedLlmRequest>) -> boo
 fn manual_agent_hints(manual: u32, effective_agent_id: &str, scope_depth: usize) -> AgentHints {
     let scale = SensitivityConfig::default().sensitivity_scale;
     AgentHints {
-        osl: 0,
+        osl: None,
         iat: 0,
         priority: (scale as i32 - manual as i32).max(0),
         latency_sensitivity: manual as f64,
