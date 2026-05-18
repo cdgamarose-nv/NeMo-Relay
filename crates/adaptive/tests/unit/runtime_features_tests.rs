@@ -131,11 +131,12 @@ fn build_learners_filters_unknown_entries() {
         &[
             "latency_sensitivity".to_string(),
             "dag_cpm".to_string(),
+            "priority_residual".to_string(),
             "unknown".to_string(),
         ],
         None,
     );
-    assert_eq!(learners.len(), 2);
+    assert_eq!(learners.len(), 3);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -269,6 +270,7 @@ async fn adaptive_hints_feature_registers_request_intercept() {
             total_requests: 4,
         }),
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -331,6 +333,7 @@ async fn tool_parallelism_feature_registers_execution_intercept() {
         trie: None,
         agent_hints_default: None,
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -401,6 +404,7 @@ async fn adaptive_runtime_register_survives_hot_cache_seed_failures() {
             trie: None,
             agent_hints_default: None,
             dag_cpm: None,
+            priority_residual: None,
             acg_profiles: std::collections::HashMap::new(),
             acg_profile_observation_counts: std::collections::HashMap::new(),
             acg_stability: None,
@@ -444,13 +448,7 @@ async fn adaptive_runtime_seeds_empty_dag_cpm_when_learner_is_enabled() {
 
     runtime.register().await.unwrap();
 
-    let dag_cpm = runtime
-        .hot_cache
-        .read()
-        .unwrap()
-        .dag_cpm
-        .as_ref()
-        .cloned();
+    let dag_cpm = runtime.hot_cache.read().unwrap().dag_cpm.as_ref().cloned();
     assert!(dag_cpm.is_some());
     assert!(dag_cpm.unwrap().nodes.is_empty());
 

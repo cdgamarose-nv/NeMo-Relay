@@ -57,6 +57,7 @@ impl LlmCodec for SharedTestCodec {
     fn encode(&self, annotated: &AnnotatedLlmRequest, original: &LlmRequest) -> Result<LlmRequest> {
         let mut content = original.content.clone();
         content["encoded_model"] = json!(annotated.model.clone());
+        content["encoded_extra"] = json!(annotated.extra.clone());
         Ok(LlmRequest {
             headers: original.headers.clone(),
             content,
@@ -153,6 +154,10 @@ fn test_run_request_intercepts_with_codec_none_and_codec_paths() {
         Box::new(|_name, mut request, annotated| {
             let mut annotated = annotated.expect("codec should provide annotated request");
             annotated.model = Some("intercepted-model".into());
+            annotated
+                .extra
+                .insert("_nemo_flow_internal".into(), json!({"adaptive_hints": true}));
+            annotated.extra.insert("public_extra".into(), json!(true));
             request.headers.insert("x-codec".into(), json!(true));
             Ok((request, Some(annotated)))
         }),
@@ -178,11 +183,23 @@ fn test_run_request_intercepts_with_codec_none_and_codec_paths() {
         request_with_codec.content["encoded_model"],
         json!("intercepted-model")
     );
+    assert_eq!(request_with_codec.content["encoded_extra"]["public_extra"], json!(true));
+    assert!(
+        request_with_codec.content["encoded_extra"]
+            .get("_nemo_flow_internal")
+            .is_none()
+    );
     assert_eq!(
         annotated_with_codec
             .as_deref()
             .and_then(|annotated| annotated.model.as_deref()),
         Some("intercepted-model")
+    );
+    assert!(
+        annotated_with_codec
+            .as_deref()
+            .and_then(|annotated| annotated.extra.get("_nemo_flow_internal"))
+            .is_some()
     );
 
     deregister_llm_request_intercept("shared-codec").unwrap();

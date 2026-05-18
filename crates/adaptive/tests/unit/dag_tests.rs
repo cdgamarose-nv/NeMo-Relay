@@ -119,6 +119,7 @@ fn empty_hot_cache() -> Arc<RwLock<HotCache>> {
         trie: None,
         agent_hints_default: None,
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -565,7 +566,7 @@ fn dag_cpm_state_updates_compact_llm_aggregates_only() {
     assert_close(planner.duration_ms_ewma, 1000.0);
     assert_close(planner.slack_ms_ewma, 0.0);
     assert_close(planner.criticality_ewma, 1.0);
-    assert_close(planner.queue_horizon_ms_ewma, 2000.0);
+    assert_close(planner.queue_horizon_ms_ewma, DEFAULT_QUEUE_HORIZON_MS);
     assert_eq!(planner.last_updated_at, Some(updated_at));
 
     let synth = &state.nodes["agent/llm:synth"];
@@ -573,8 +574,14 @@ fn dag_cpm_state_updates_compact_llm_aggregates_only() {
     assert_close(synth.duration_ms_ewma, 1000.0);
     assert_close(synth.slack_ms_ewma, 0.0);
     assert_close(synth.criticality_ewma, 1.0);
-    assert_close(synth.queue_horizon_ms_ewma, 2000.0);
+    assert_close(synth.queue_horizon_ms_ewma, DEFAULT_QUEUE_HORIZON_MS);
     assert_eq!(synth.last_updated_at, Some(updated_at));
+    assert_eq!(state.global_queue_wait.samples_ms, vec![1200.0, 2000.0]);
+    assert_eq!(
+        state.queue_wait_by_model["planner"].samples_ms,
+        vec![1200.0]
+    );
+    assert_eq!(state.queue_wait_by_model["model"].samples_ms, vec![2000.0]);
 }
 
 #[test]
@@ -614,6 +621,36 @@ fn dag_cpm_state_updates_existing_nodes_with_ewma() {
     assert_close(node.slack_ms_ewma, 0.0);
     assert_close(node.criticality_ewma, 1.0);
     assert_close(node.queue_horizon_ms_ewma, DEFAULT_QUEUE_HORIZON_MS);
+}
+
+#[test]
+fn dag_cpm_state_uses_previous_per_model_queue_window_for_horizon() {
+    let base = Utc::now();
+    let mut state = DagCpmState::new("agent");
+    for wait_ms in [1000.0, 2000.0, 3000.0, 4000.0] {
+        state
+            .queue_wait_by_model
+            .entry("single".to_string())
+            .or_default()
+            .observe(wait_ms, base);
+        state.global_queue_wait.observe(wait_ms, base);
+    }
+
+    let mut single = call(CallKind::Llm, "single", base, 0, Some(1000), None);
+    single.backend_timing = Some(BackendTiming {
+        prefill_wait_time_ms: Some(1500.0),
+        total_time_ms: Some(2500.0),
+        ..BackendTiming::default()
+    });
+
+    assert!(state.update_from_run(&run(vec![single]), base + Duration::milliseconds(1000),));
+
+    let node = &state.nodes["agent/llm:single"];
+    assert_close(node.queue_horizon_ms_ewma, 4000.0);
+    assert_eq!(
+        state.queue_wait_by_model["single"].samples_ms,
+        vec![1000.0, 2000.0, 3000.0, 4000.0, 1500.0]
+    );
 }
 
 #[test]

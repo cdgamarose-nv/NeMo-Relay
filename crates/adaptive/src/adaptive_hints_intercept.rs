@@ -25,12 +25,20 @@ use crate::dag::{
     project_priority_prior,
 };
 use crate::intercepts::AGENT_HINTS_HEADER_KEY;
+use crate::priority_residual::PriorityResidualState;
 use crate::trie::builder::SensitivityConfig;
 use crate::trie::lookup::PredictionTrieLookup;
 use crate::types::cache::HotCache;
 use crate::types::metadata::AgentHints;
+use crate::types::records::{CallAdaptiveHints, write_call_adaptive_hints};
 
 const DEFAULT_PRIORITY_ADJUSTMENT: i32 = 0;
+
+#[derive(Debug, Default)]
+struct HintSelection {
+    hints: Option<AgentHints>,
+    feedback: Option<CallAdaptiveHints>,
+}
 
 /// Builds [`AgentHints`] from a trie prediction and optional default hints.
 ///
@@ -84,37 +92,99 @@ fn apply_manual_latency_override(
 fn apply_dag_priority_prior(
     hints: Option<AgentHints>,
     dag_cpm: Option<&DagCpmState>,
+    priority_residual: Option<&PriorityResidualState>,
     structural_key: &str,
+    model_name: &str,
     effective_agent_id: &str,
     scope_depth: usize,
     priority_cap: u32,
     fallback_priority: Option<u32>,
-) -> Option<AgentHints> {
-    let learned_priority = dag_cpm
+) -> HintSelection {
+    let learned = dag_cpm
         .and_then(|state| state.nodes.get(structural_key))
-        .and_then(|node| project_priority_prior(node, DEFAULT_PRIORITY_ADJUSTMENT, priority_cap));
+        .and_then(|node| {
+            let priority = project_priority_prior(node, DEFAULT_PRIORITY_ADJUSTMENT, priority_cap)?;
+            Some((priority, node.criticality_ewma))
+        });
 
-    match (hints, learned_priority, fallback_priority) {
-        (Some(mut hints), Some(priority), _) => {
+    match (hints, learned, fallback_priority) {
+        (Some(mut hints), Some((priority, criticality)), _) => {
+            let (priority, feedback) = apply_priority_residual(
+                priority,
+                priority_residual,
+                criticality,
+                model_name,
+                priority_cap,
+            );
             hints.priority = priority as i32;
-            Some(hints)
+            HintSelection {
+                hints: Some(hints),
+                feedback,
+            }
         }
-        (None, Some(priority), _) => Some(priority_only_agent_hints(
-            priority,
-            effective_agent_id,
-            scope_depth,
-        )),
+        (None, Some((priority, criticality)), _) => {
+            let (priority, feedback) = apply_priority_residual(
+                priority,
+                priority_residual,
+                criticality,
+                model_name,
+                priority_cap,
+            );
+            HintSelection {
+                hints: Some(priority_only_agent_hints(
+                    priority,
+                    effective_agent_id,
+                    scope_depth,
+                )),
+                feedback,
+            }
+        }
         (Some(mut hints), None, Some(priority)) => {
             hints.priority = hints.priority.max(priority as i32);
-            Some(hints)
+            HintSelection {
+                hints: Some(hints),
+                feedback: None,
+            }
         }
-        (None, None, Some(priority)) => Some(priority_only_agent_hints(
-            priority,
-            effective_agent_id,
-            scope_depth,
-        )),
-        (hints, None, None) => hints,
+        (None, None, Some(priority)) => HintSelection {
+            hints: Some(priority_only_agent_hints(
+                priority,
+                effective_agent_id,
+                scope_depth,
+            )),
+            feedback: None,
+        },
+        (hints, None, None) => HintSelection {
+            hints,
+            feedback: None,
+        },
     }
+}
+
+fn apply_priority_residual(
+    priority_prior: u32,
+    priority_residual: Option<&PriorityResidualState>,
+    criticality: f64,
+    model_name: &str,
+    priority_cap: u32,
+) -> (u32, Option<CallAdaptiveHints>) {
+    let Some(decision) =
+        priority_residual.and_then(|state| state.decision(criticality, model_name))
+    else {
+        return (priority_prior, None);
+    };
+    let cap = priority_cap.min(MAX_DAG_PRIORITY_CAP);
+    let priority = (priority_prior as i32 + decision.delta).clamp(0, cap as i32) as u32;
+    (
+        priority,
+        Some(CallAdaptiveHints {
+            selected_priority_residual_arm: Some(decision.action.arm()),
+            selected_priority_residual_key: Some(decision.key),
+            emitted_priority: Some(priority),
+            priority_cap: Some(cap),
+            ..CallAdaptiveHints::default()
+        }),
+    )
 }
 
 fn priority_only_agent_hints(
@@ -230,7 +300,7 @@ impl AdaptiveHintsIntercept {
         resolve_agent_id().unwrap_or_else(|| self.agent_id.clone())
     }
 
-    fn load_hints(
+    fn load_hint_selection(
         &self,
         llm_name: &str,
         scope_path: &[String],
@@ -239,9 +309,9 @@ impl AdaptiveHintsIntercept {
         scope_depth: usize,
         priority_cap: u32,
         annotated: Option<&AnnotatedLlmRequest>,
-    ) -> Option<AgentHints> {
+    ) -> HintSelection {
         let Ok(cache_guard) = self.hot_cache.read() else {
-            return None;
+            return HintSelection::default();
         };
 
         let trie_hints = if let Some(ref trie) = cache_guard.trie {
@@ -262,10 +332,15 @@ impl AdaptiveHintsIntercept {
         let fallback_priority = cache_guard.dag_cpm.as_ref().and_then(|_| {
             fallback_priority_prior(annotated, call_index, scope_depth, priority_cap)
         });
+        let model_name = annotated
+            .and_then(|request| request.model.as_deref())
+            .unwrap_or(llm_name);
         apply_dag_priority_prior(
             trie_hints,
             cache_guard.dag_cpm.as_ref(),
+            cache_guard.priority_residual.as_ref(),
             &structural_key,
+            model_name,
             effective_agent_id,
             scope_depth,
             priority_cap,
@@ -282,7 +357,9 @@ impl AdaptiveHintsIntercept {
     pub fn into_request_fn(self) -> LlmRequestInterceptFn {
         let this = Arc::new(self);
         Box::new(
-            move |name: &str, mut request: LlmRequest, annotated: Option<AnnotatedLlmRequest>| {
+            move |name: &str,
+                  mut request: LlmRequest,
+                  mut annotated: Option<AnnotatedLlmRequest>| {
                 let scope_path = extract_scope_path();
                 let manual_ls = read_manual_latency_sensitivity();
                 let priority_cap = priority_cap_for_workflow_class(read_workflow_class());
@@ -290,7 +367,7 @@ impl AdaptiveHintsIntercept {
                 let call_index = this.call_counter.fetch_add(1, Ordering::Relaxed);
 
                 let effective_agent_id = this.effective_agent_id();
-                let cached_hints = this.load_hints(
+                let mut selection = this.load_hint_selection(
                     name,
                     &scope_path,
                     &effective_agent_id,
@@ -300,7 +377,7 @@ impl AdaptiveHintsIntercept {
                     annotated.as_ref(),
                 );
                 let final_hints = apply_manual_latency_override(
-                    cached_hints,
+                    selection.hints.take(),
                     manual_ls,
                     &effective_agent_id,
                     scope_depth,
@@ -308,6 +385,12 @@ impl AdaptiveHintsIntercept {
 
                 if let Some(hints) = final_hints {
                     inject_agent_hints(&mut request, &hints);
+                    if manual_ls.is_none()
+                        && let Some(feedback) = selection.feedback.as_ref()
+                        && let Some(annotated) = annotated.as_mut()
+                    {
+                        write_call_adaptive_hints(annotated, feedback);
+                    }
                 }
 
                 Ok((request, annotated))

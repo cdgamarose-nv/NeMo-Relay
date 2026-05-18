@@ -8,7 +8,12 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::dag::{DagCpmNodeState, DagCpmState};
+use crate::priority_residual::{
+    PressureState, PriorityResidualAction, PriorityResidualArmState, PriorityResidualContextState,
+    PriorityResidualState,
+};
 use crate::trie::data_models::{LlmCallPrediction, PredictionMetrics};
+use chrono::Utc;
 use nemo_flow::api::runtime::current_scope_stack;
 use nemo_flow::api::scope::ScopeType;
 use nemo_flow::api::scope::{pop_scope, push_scope};
@@ -128,6 +133,7 @@ fn test_adaptive_hints_intercept_new() {
         trie: None,
         agent_hints_default: None,
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -145,6 +151,7 @@ fn test_adaptive_hints_intercept_into_request_fn_compiles() {
         trie: None,
         agent_hints_default: None,
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -174,6 +181,7 @@ fn test_adaptive_hints_intercept_injects_prediction_hints_and_manual_override() 
         trie: Some(root),
         agent_hints_default: None,
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -279,6 +287,7 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
         trie: None,
         agent_hints_default: Some(defaults.clone()),
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -310,6 +319,7 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
         trie: None,
         agent_hints_default: Some(defaults),
         dag_cpm: None,
+        priority_residual: None,
         acg_profiles: std::collections::HashMap::new(),
         acg_profile_observation_counts: std::collections::HashMap::new(),
         acg_stability: None,
@@ -377,6 +387,7 @@ fn test_adaptive_hints_intercept_overrides_cached_priority_from_dag_cpm() {
         trie: None,
         agent_hints_default: Some(defaults),
         dag_cpm: Some(dag_cpm),
+        priority_residual: None,
         acg_profiles: HashMap::new(),
         acg_profile_observation_counts: HashMap::new(),
         acg_stability: None,
@@ -425,6 +436,7 @@ fn test_adaptive_hints_intercept_emits_priority_only_from_dag_cpm() {
         trie: None,
         agent_hints_default: None,
         dag_cpm: Some(dag_cpm),
+        priority_residual: None,
         acg_profiles: HashMap::new(),
         acg_profile_observation_counts: HashMap::new(),
         acg_stability: None,
@@ -450,6 +462,101 @@ fn test_adaptive_hints_intercept_emits_priority_only_from_dag_cpm() {
     assert_eq!(
         body_hints["prefix_id"],
         serde_json::json!("fallback-agent-d0")
+    );
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_applies_priority_residual_and_records_feedback() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let mut dag_cpm = DagCpmState::new("fallback-agent");
+    dag_cpm.nodes.insert(
+        "root/llm:model".to_string(),
+        DagCpmNodeState {
+            observation_count: 1,
+            duration_ms_ewma: 1000.0,
+            slack_ms_ewma: 1200.0,
+            criticality_ewma: 0.6,
+            queue_horizon_ms_ewma: 3000.0,
+            last_updated_at: None,
+        },
+    );
+
+    let now = Utc::now();
+    let residual_key = "crit:medium|pressure:high|model:model".to_string();
+    let mut residual_context = PriorityResidualContextState::default();
+    residual_context.arms[PriorityResidualAction::Noop.arm() as usize] = PriorityResidualArmState {
+        pulls: 1,
+        effective_pulls: 1.0,
+        mean_loss: 1.0,
+    };
+    residual_context.total_pulls = 1;
+    residual_context.last_updated_at = Some(now);
+    let mut priority_residual = PriorityResidualState::new("fallback-agent");
+    priority_residual
+        .contexts
+        .insert(residual_key.clone(), residual_context);
+    priority_residual.pressure_by_model.insert(
+        "model".to_string(),
+        PressureState {
+            prefill_wait_time_ms: 1200.0,
+            last_updated_at: Some(now),
+        },
+    );
+
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: Some(dag_cpm),
+        priority_residual: Some(priority_residual),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+    let annotated = annotated_with_messages(vec![Message::User {
+        content: MessageContent::Text("hello".into()),
+        name: None,
+    }]);
+
+    let (request, returned_annotated) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        Some(annotated),
+    )
+    .unwrap();
+
+    assert_eq!(
+        request.content["nvext"]["agent_hints"]["priority"],
+        serde_json::json!(3)
+    );
+    assert!(request.content.get("_nemo_flow_internal").is_none());
+    let internal = returned_annotated
+        .unwrap()
+        .extra
+        .get("_nemo_flow_internal")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        internal["adaptive_hints"]["selected_priority_residual_arm"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        internal["adaptive_hints"]["selected_priority_residual_key"],
+        serde_json::json!(residual_key)
+    );
+    assert_eq!(
+        internal["adaptive_hints"]["emitted_priority"],
+        serde_json::json!(3)
     );
 
     reset_root_metadata();
@@ -486,6 +593,7 @@ fn test_adaptive_hints_intercept_uses_workflow_class_priority_cap() {
         trie: None,
         agent_hints_default: None,
         dag_cpm: Some(dag_cpm),
+        priority_residual: None,
         acg_profiles: HashMap::new(),
         acg_profile_observation_counts: HashMap::new(),
         acg_stability: None,
@@ -522,6 +630,7 @@ fn test_adaptive_hints_intercept_uses_join_fallback_without_matching_dag_cpm_nod
         trie: None,
         agent_hints_default: None,
         dag_cpm: Some(DagCpmState::new("fallback-agent")),
+        priority_residual: None,
         acg_profiles: HashMap::new(),
         acg_profile_observation_counts: HashMap::new(),
         acg_stability: None,
@@ -574,6 +683,7 @@ fn test_adaptive_hints_intercept_caps_join_fallback_for_background_workflow() {
         trie: None,
         agent_hints_default: None,
         dag_cpm: Some(DagCpmState::new("fallback-agent")),
+        priority_residual: None,
         acg_profiles: HashMap::new(),
         acg_profile_observation_counts: HashMap::new(),
         acg_stability: None,
@@ -614,6 +724,7 @@ fn test_adaptive_hints_intercept_uses_small_root_fallback_without_matching_dag_c
         trie: None,
         agent_hints_default: None,
         dag_cpm: Some(DagCpmState::new("fallback-agent")),
+        priority_residual: None,
         acg_profiles: HashMap::new(),
         acg_profile_observation_counts: HashMap::new(),
         acg_stability: None,

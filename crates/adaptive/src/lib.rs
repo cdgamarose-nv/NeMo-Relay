@@ -23,7 +23,9 @@ pub mod error;
 pub mod intercepts;
 /// Learning primitives and built-in learner implementations.
 pub mod learner;
+mod model;
 pub mod plugin_component;
+pub mod priority_residual;
 #[cfg(feature = "redis-backend")]
 pub mod redis;
 mod runtime;

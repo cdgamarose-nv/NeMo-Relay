@@ -262,6 +262,44 @@ fn validate_config_reports_version_mode_and_telemetry_gaps() {
 }
 
 #[test]
+fn validate_config_rejects_priority_residual_without_dag_cpm() {
+    let report = validate_config(&AdaptiveConfig {
+        state: Some(StateConfig {
+            backend: BackendSpec::in_memory(),
+        }),
+        telemetry: Some(TelemetryComponentConfig {
+            subscriber_name: None,
+            learners: vec!["priority_residual".to_string()],
+        }),
+        ..AdaptiveConfig::default()
+    });
+
+    assert!(report.has_errors());
+    assert!(report.diagnostics.iter().any(|diag| {
+        diag.code == "adaptive.missing_required_learner"
+            && diag.component.as_deref() == Some("telemetry")
+            && diag.field.as_deref() == Some("learners")
+    }));
+
+    let valid_report = validate_config(&AdaptiveConfig {
+        state: Some(StateConfig {
+            backend: BackendSpec::in_memory(),
+        }),
+        telemetry: Some(TelemetryComponentConfig {
+            subscriber_name: None,
+            learners: vec!["dag_cpm".to_string(), "priority_residual".to_string()],
+        }),
+        ..AdaptiveConfig::default()
+    });
+    assert!(
+        !valid_report
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code == "adaptive.missing_required_learner")
+    );
+}
+
+#[test]
 fn validate_config_reports_unknown_backend_and_acg_provider_per_policy() {
     let warn_report = validate_config(&AdaptiveConfig {
         state: Some(StateConfig {

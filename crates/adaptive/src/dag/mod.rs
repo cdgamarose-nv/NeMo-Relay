@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::error::{AdaptiveError, Result};
 use crate::learner::traits::Learner;
+use crate::model::model_bucket;
 use crate::storage::traits::StorageBackendDyn;
 use crate::types::cache::HotCache;
 use crate::types::records::{CallKind, CallRecord, RunRecord};
@@ -25,6 +26,9 @@ const MAX_QUEUE_HORIZON_MS: f64 = 9000.0;
 const DAG_CPM_EWMA_ALPHA: f64 = 0.2;
 const DAG_CPM_RETENTION_DAYS: i64 = 14;
 const DAG_CPM_MAX_NODES: usize = 512;
+const DAG_CPM_MAX_QUEUE_MODELS: usize = 64;
+const DAG_CPM_QUEUE_WAIT_WINDOW: usize = 256;
+const DAG_CPM_MIN_QUEUE_WAIT_SAMPLES: usize = 4;
 pub(crate) const DEFAULT_DAG_PRIORITY_CAP: u32 = 3;
 pub(crate) const MAX_DAG_PRIORITY_CAP: u32 = 5;
 
@@ -36,6 +40,12 @@ pub struct DagCpmState {
     /// Learned per-node summaries keyed by stable structural path.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub nodes: HashMap<String, DagCpmNodeState>,
+    /// Rolling queue-wait observations by normalized model.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub queue_wait_by_model: HashMap<String, DagQueueWaitWindow>,
+    /// Rolling queue-wait observations across all models.
+    #[serde(default, skip_serializing_if = "DagQueueWaitWindow::is_empty")]
+    pub global_queue_wait: DagQueueWaitWindow,
 }
 
 impl DagCpmState {
@@ -44,6 +54,8 @@ impl DagCpmState {
         Self {
             agent_id: agent_id.into(),
             nodes: HashMap::new(),
+            queue_wait_by_model: HashMap::new(),
+            global_queue_wait: DagQueueWaitWindow::default(),
         }
     }
 
@@ -52,38 +64,39 @@ impl DagCpmState {
     /// Returns `true` when at least one priority-emitting node was incorporated.
     pub(crate) fn update_from_run(&mut self, run: &RunRecord, updated_at: DateTime<Utc>) -> bool {
         let dag = build_completed_run_dag(run);
-        let Some(cpm) = compute_cpm(&dag, observed_queue_horizon_ms(run)) else {
+        let Some(cpm) = self.compute_cpm_for_dag(&dag) else {
             return false;
         };
-        let updated = self.update_from_cpm(&dag, &cpm, updated_at);
+        let samples = cpm_samples_from(&dag, &cpm);
+        let updated = self.update_from_samples(&samples, updated_at);
+        let observed_queue = self.observe_queue_waits(run, updated_at);
         let pruned = self.prune(updated_at);
-        updated || pruned
+        updated || observed_queue || pruned
     }
 
-    fn update_from_cpm(
+    fn update_from_samples(
         &mut self,
-        dag: &CompletedRunDag,
-        cpm: &CompletedRunCpm,
+        samples: &[DagCpmCallSample],
         updated_at: DateTime<Utc>,
     ) -> bool {
         let mut updated = false;
-        for (node, cpm_node) in cpm.priority_nodes(dag) {
+        for sample in samples {
             if !is_valid_sample(
-                node.duration_ms,
-                cpm_node.slack_ms,
-                cpm_node.criticality,
-                cpm.queue_horizon_ms,
+                sample.duration_ms,
+                sample.slack_ms,
+                sample.criticality,
+                sample.queue_horizon_ms,
             ) {
                 continue;
             }
             self.nodes
-                .entry(node.structural_key.clone())
+                .entry(sample.structural_key.clone())
                 .or_default()
                 .observe(
-                    node.duration_ms,
-                    cpm_node.slack_ms,
-                    cpm_node.criticality,
-                    cpm.queue_horizon_ms,
+                    sample.duration_ms,
+                    sample.slack_ms,
+                    sample.criticality,
+                    sample.queue_horizon_ms,
                     updated_at,
                 );
             updated = true;
@@ -94,27 +107,60 @@ impl DagCpmState {
     fn prune(&mut self, now: DateTime<Utc>) -> bool {
         let cutoff = now - Duration::days(DAG_CPM_RETENTION_DAYS);
         let initial_len = self.nodes.len();
-        self.nodes
-            .retain(|_, node| node.last_updated_at.is_none_or(|updated_at| updated_at >= cutoff));
-
-        if self.nodes.len() <= DAG_CPM_MAX_NODES {
-            return self.nodes.len() != initial_len;
-        }
-
-        let mut entries = self
-            .nodes
-            .iter()
-            .map(|(key, node)| (key.clone(), node.last_updated_at, node.observation_count))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|(_, last_updated_at, observation_count)| {
-            (*last_updated_at, *observation_count)
+        let initial_models = self.queue_wait_by_model.len();
+        self.nodes.retain(|_, node| {
+            node.last_updated_at
+                .is_none_or(|updated_at| updated_at >= cutoff)
+        });
+        self.queue_wait_by_model.retain(|_, window| {
+            window
+                .last_updated_at
+                .is_none_or(|updated_at| updated_at >= cutoff)
         });
 
-        let remove_count = self.nodes.len() - DAG_CPM_MAX_NODES;
-        for (key, _, _) in entries.into_iter().take(remove_count) {
-            self.nodes.remove(&key);
+        prune_queue_wait_models(&mut self.queue_wait_by_model, DAG_CPM_MAX_QUEUE_MODELS);
+
+        let pruned_nodes = prune_nodes(&mut self.nodes, DAG_CPM_MAX_NODES);
+        self.nodes.len() != initial_len
+            || self.queue_wait_by_model.len() != initial_models
+            || pruned_nodes
+    }
+
+    fn compute_cpm_for_dag(&self, dag: &CompletedRunDag) -> Option<CompletedRunCpm> {
+        let global_horizon = self.queue_horizon_for_model(None);
+        compute_cpm_with_horizons(dag, global_horizon, |node| {
+            if node.kind == CallKind::Llm {
+                self.queue_horizon_for_model(Some(&node.model_bucket))
+            } else {
+                global_horizon
+            }
+        })
+    }
+
+    fn queue_horizon_for_model(&self, model: Option<&str>) -> f64 {
+        model
+            .and_then(|model| self.queue_wait_by_model.get(model))
+            .and_then(DagQueueWaitWindow::p90_if_enough)
+            .or_else(|| self.global_queue_wait.p90_if_enough())
+            .unwrap_or(DEFAULT_QUEUE_HORIZON_MS)
+            .clamp(JUMP_UNIT_MS, MAX_QUEUE_HORIZON_MS)
+    }
+
+    fn observe_queue_waits(&mut self, run: &RunRecord, updated_at: DateTime<Utc>) -> bool {
+        let mut updated = false;
+        for call in run.calls.iter().filter(|call| call.kind == CallKind::Llm) {
+            let Some(wait_ms) = backend_prefill_wait_ms(call) else {
+                continue;
+            };
+            let model = call_model_bucket(call);
+            self.global_queue_wait.observe(wait_ms, updated_at);
+            self.queue_wait_by_model
+                .entry(model)
+                .or_default()
+                .observe(wait_ms, updated_at);
+            updated = true;
         }
-        true
+        updated
     }
 }
 
@@ -134,6 +180,42 @@ pub struct DagCpmNodeState {
     /// Last update timestamp for retention and staleness checks.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_updated_at: Option<DateTime<Utc>>,
+}
+
+/// Bounded rolling queue-wait samples used to estimate scheduler pressure.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DagQueueWaitWindow {
+    /// Recent backend queue/admission waits in milliseconds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples_ms: Vec<f64>,
+    /// Last update timestamp for retention and pruning.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_updated_at: Option<DateTime<Utc>>,
+}
+
+impl DagQueueWaitWindow {
+    fn observe(&mut self, wait_ms: f64, updated_at: DateTime<Utc>) {
+        if !wait_ms.is_finite() || wait_ms < 0.0 {
+            return;
+        }
+        self.samples_ms.push(wait_ms);
+        if self.samples_ms.len() > DAG_CPM_QUEUE_WAIT_WINDOW {
+            let remove_count = self.samples_ms.len() - DAG_CPM_QUEUE_WAIT_WINDOW;
+            self.samples_ms.drain(0..remove_count);
+        }
+        self.last_updated_at = Some(updated_at);
+    }
+
+    fn p90_if_enough(&self) -> Option<f64> {
+        if self.samples_ms.len() < DAG_CPM_MIN_QUEUE_WAIT_SAMPLES {
+            return None;
+        }
+        p90(self.samples_ms.iter().copied())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.samples_ms.is_empty() && self.last_updated_at.is_none()
+    }
 }
 
 impl DagCpmNodeState {
@@ -254,8 +336,27 @@ pub(crate) struct RunDagCpmNode {
     pub(crate) latest_finish_ms: f64,
     /// CPM slack in milliseconds.
     pub(crate) slack_ms: f64,
+    /// Queue-delay horizon used for this node's criticality.
+    pub(crate) queue_horizon_ms: f64,
     /// Normalized criticality in `[0, 1]`.
     pub(crate) criticality: f64,
+}
+
+/// CPM facts for one priority-emitting LLM call in a completed run.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DagCpmCallSample {
+    /// Runtime scope UUID for the original LLM call.
+    pub(crate) scope_uuid: Uuid,
+    /// Stable structural key used by the hot path.
+    pub(crate) structural_key: String,
+    /// Model service duration used by CPM.
+    pub(crate) duration_ms: f64,
+    /// CPM slack for the call.
+    pub(crate) slack_ms: f64,
+    /// Normalized criticality in `[0, 1]`.
+    pub(crate) criticality: f64,
+    /// Queue-delay horizon used to compute criticality.
+    pub(crate) queue_horizon_ms: f64,
 }
 
 /// One completed tool or LLM call in a run-local DAG.
@@ -277,6 +378,8 @@ pub(crate) struct RunDagNode {
     pub(crate) name: String,
     /// Stable structural key used for learned DAG state lookup.
     pub(crate) structural_key: String,
+    /// Normalized model bucket for pressure lookup.
+    pub(crate) model_bucket: String,
     /// Observed start timestamp.
     pub(crate) started_at: DateTime<Utc>,
     /// Observed end timestamp.
@@ -350,6 +453,7 @@ pub(crate) fn build_completed_run_dag(run: &RunRecord) -> CompletedRunDag {
             kind: call.kind,
             name: call.name.clone(),
             structural_key: structural_key(call),
+            model_bucket: call_model_bucket(call),
             started_at: call.started_at,
             ended_at,
             duration_ms: cpm_duration_ms(call, ended_at),
@@ -382,6 +486,14 @@ pub(crate) fn compute_cpm(
     observed_queue_horizon_ms: Option<f64>,
 ) -> Option<CompletedRunCpm> {
     let queue_horizon_ms = queue_horizon_ms(observed_queue_horizon_ms);
+    compute_cpm_with_horizons(dag, queue_horizon_ms, |_| queue_horizon_ms)
+}
+
+fn compute_cpm_with_horizons(
+    dag: &CompletedRunDag,
+    summary_queue_horizon_ms: f64,
+    horizon_for_node: impl Fn(&RunDagNode) -> f64,
+) -> Option<CompletedRunCpm> {
     let (predecessors, successors) = adjacency(dag)?;
     let topology = topological_order(&predecessors, &successors)?;
     let node_count = dag.nodes.len();
@@ -417,6 +529,7 @@ pub(crate) fn compute_cpm(
     let nodes = (0..node_count)
         .map(|node_index| {
             let slack_ms = latest_start_ms[node_index] - earliest_start_ms[node_index];
+            let queue_horizon_ms = clamp_queue_horizon(horizon_for_node(&dag.nodes[node_index]));
             RunDagCpmNode {
                 node_index,
                 earliest_start_ms: earliest_start_ms[node_index],
@@ -424,6 +537,7 @@ pub(crate) fn compute_cpm(
                 latest_start_ms: latest_start_ms[node_index],
                 latest_finish_ms: latest_finish_ms[node_index],
                 slack_ms,
+                queue_horizon_ms,
                 criticality: criticality_from_slack(slack_ms, queue_horizon_ms),
             }
         })
@@ -432,15 +546,42 @@ pub(crate) fn compute_cpm(
     Some(CompletedRunCpm {
         run_id: dag.run_id,
         workflow_finish_ms,
-        queue_horizon_ms,
+        queue_horizon_ms: summary_queue_horizon_ms,
         nodes,
     })
+}
+
+/// Compute reusable CPM samples for priority-emitting LLM calls in a run.
+pub(crate) fn cpm_call_samples(run: &RunRecord) -> Option<Vec<DagCpmCallSample>> {
+    let dag = build_completed_run_dag(run);
+    let cpm = compute_cpm(&dag, None)?;
+    Some(cpm_samples_from(&dag, &cpm))
+}
+
+fn cpm_samples_from(dag: &CompletedRunDag, cpm: &CompletedRunCpm) -> Vec<DagCpmCallSample> {
+    cpm.priority_nodes(dag)
+        .map(|(node, cpm_node)| DagCpmCallSample {
+            scope_uuid: node.scope_uuid,
+            structural_key: node.structural_key.clone(),
+            duration_ms: node.duration_ms,
+            slack_ms: cpm_node.slack_ms,
+            criticality: cpm_node.criticality,
+            queue_horizon_ms: cpm_node.queue_horizon_ms,
+        })
+        .collect()
 }
 
 fn queue_horizon_ms(observed_queue_horizon_ms: Option<f64>) -> f64 {
     let horizon = observed_queue_horizon_ms
         .filter(|value| value.is_finite())
         .unwrap_or(DEFAULT_QUEUE_HORIZON_MS);
+    clamp_queue_horizon(horizon)
+}
+
+fn clamp_queue_horizon(horizon: f64) -> f64 {
+    if !horizon.is_finite() {
+        return DEFAULT_QUEUE_HORIZON_MS;
+    }
     horizon.clamp(JUMP_UNIT_MS, MAX_QUEUE_HORIZON_MS)
 }
 
@@ -448,11 +589,8 @@ fn criticality_from_slack(slack_ms: f64, queue_horizon_ms: f64) -> f64 {
     1.0 - (slack_ms.max(0.0) / queue_horizon_ms).clamp(0.0, 1.0)
 }
 
-fn observed_queue_horizon_ms(run: &RunRecord) -> Option<f64> {
-    let mut waits = run
-        .calls
-        .iter()
-        .filter_map(|call| call.backend_timing.as_ref()?.prefill_wait_time_ms)
+fn p90(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut waits = values
         .filter(|value| value.is_finite() && *value >= 0.0)
         .collect::<Vec<_>>();
     if waits.is_empty() {
@@ -530,6 +668,16 @@ fn structural_key(call: &CallRecord) -> String {
         CallKind::Tool => "tool",
     };
     structural_key_parts(kind, &call.function_path, &call.name)
+}
+
+fn call_model_bucket(call: &CallRecord) -> String {
+    let model_name = call
+        .annotated_request
+        .as_ref()
+        .and_then(|request| request.model.as_deref())
+        .or(call.model_name.as_deref())
+        .unwrap_or(call.name.as_str());
+    model_bucket(model_name)
 }
 
 /// Build the learned structural key for a hot-path LLM request.
@@ -613,6 +761,54 @@ fn observed_duration_ms(started_at: DateTime<Utc>, ended_at: DateTime<Utc>) -> f
         .signed_duration_since(started_at)
         .num_milliseconds()
         .max(0) as f64
+}
+
+fn backend_prefill_wait_ms(call: &CallRecord) -> Option<f64> {
+    call.backend_timing
+        .as_ref()
+        .and_then(|timing| timing.prefill_wait_time_ms)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn prune_nodes(nodes: &mut HashMap<String, DagCpmNodeState>, max_nodes: usize) -> bool {
+    if nodes.len() <= max_nodes {
+        return false;
+    }
+
+    let mut entries = nodes
+        .iter()
+        .map(|(key, node)| (key.clone(), node.last_updated_at, node.observation_count))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, last_updated_at, observation_count)| {
+        (*last_updated_at, *observation_count)
+    });
+
+    let remove_count = nodes.len() - max_nodes;
+    for (key, _, _) in entries.into_iter().take(remove_count) {
+        nodes.remove(&key);
+    }
+    true
+}
+
+fn prune_queue_wait_models(
+    windows: &mut HashMap<String, DagQueueWaitWindow>,
+    max_models: usize,
+) -> bool {
+    if windows.len() <= max_models {
+        return false;
+    }
+
+    let mut entries = windows
+        .iter()
+        .map(|(key, window)| (key.clone(), window.last_updated_at, window.samples_ms.len()))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, last_updated_at, sample_count)| (*last_updated_at, *sample_count));
+
+    let remove_count = windows.len() - max_models;
+    for (key, _, _) in entries.into_iter().take(remove_count) {
+        windows.remove(&key);
+    }
+    true
 }
 
 fn add_parent_scope_edges(

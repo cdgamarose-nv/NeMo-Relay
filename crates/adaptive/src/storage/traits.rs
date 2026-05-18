@@ -8,6 +8,7 @@ use std::pin::Pin;
 
 use crate::dag::DagCpmState;
 use crate::error::Result;
+use crate::priority_residual::PriorityResidualState;
 use crate::trie::accumulator::AccumulatorState;
 use crate::trie::serialization::TrieEnvelope;
 use crate::types::plan::ExecutionPlan;
@@ -90,6 +91,29 @@ pub trait StorageBackendDyn: Send + Sync + 'static {
         &'a self,
         _agent_id: &'a str,
     ) -> BoxStorageFuture<'a, Option<DagCpmState>> {
+        Box::pin(async move { Ok(None) })
+    }
+
+    /// Persist priority residual learner state for an agent.
+    ///
+    /// # Notes
+    /// The default implementation is a no-op.
+    fn store_priority_residual_state<'a>(
+        &'a self,
+        _agent_id: &'a str,
+        _state: &'a PriorityResidualState,
+    ) -> BoxStorageFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Load priority residual learner state for an agent.
+    ///
+    /// # Notes
+    /// The default implementation returns `Ok(None)`.
+    fn load_priority_residual_state<'a>(
+        &'a self,
+        _agent_id: &'a str,
+    ) -> BoxStorageFuture<'a, Option<PriorityResidualState>> {
         Box::pin(async move { Ok(None) })
     }
 

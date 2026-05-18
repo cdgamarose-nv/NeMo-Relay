@@ -45,6 +45,10 @@ pub fn validate_config(config: &AdaptiveConfig) -> ConfigReport {
         });
     }
 
+    if let Some(telemetry) = &config.telemetry {
+        validate_learners(&mut report, telemetry.learners.as_slice());
+    }
+
     if let Some(tool_parallelism) = &config.tool_parallelism
         && tool_parallelism.mode != "observe_only"
         && tool_parallelism.mode != "inject_hints"
@@ -82,6 +86,22 @@ pub fn validate_config(config: &AdaptiveConfig) -> ConfigReport {
     }
 
     report
+}
+
+fn validate_learners(report: &mut ConfigReport, learners: &[String]) {
+    let has_priority_residual = learners
+        .iter()
+        .any(|learner| learner == "priority_residual");
+    let has_dag_cpm = learners.iter().any(|learner| learner == "dag_cpm");
+    if has_priority_residual && !has_dag_cpm {
+        report.diagnostics.push(ConfigDiagnostic {
+            level: DiagnosticLevel::Error,
+            code: "adaptive.missing_required_learner".to_string(),
+            component: Some("telemetry".to_string()),
+            field: Some("learners".to_string()),
+            message: "priority_residual requires dag_cpm because residual priority updates are applied to the DAG CPM structural prior".to_string(),
+        });
+    }
 }
 
 fn validate_backend(report: &mut ConfigReport, policy: &ConfigPolicy, backend: &BackendSpec) {

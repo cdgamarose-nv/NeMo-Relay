@@ -43,6 +43,7 @@ use crate::error::{AdaptiveError, Result};
 use crate::intercepts::create_tool_execution_intercept_with_mode;
 use crate::learner::latency::LatencySensitivityLearner;
 use crate::learner::traits::Learner;
+use crate::priority_residual::{PriorityResidualLearner, PriorityResidualState};
 use crate::runtime::backend::build_backend;
 use crate::runtime::validation::validate_config;
 use crate::storage::traits::StorageBackendDyn;
@@ -212,6 +213,7 @@ impl AdaptiveRuntime {
                 trie: None,
                 agent_hints_default: None,
                 dag_cpm: None,
+                priority_residual: None,
                 acg_profiles: std::collections::HashMap::new(),
                 acg_profile_observation_counts: std::collections::HashMap::new(),
                 acg_stability: None,
@@ -397,6 +399,7 @@ impl AdaptiveRuntime {
             self.hot_cache.clone(),
             &agent_id,
             self.dag_cpm_enabled(),
+            self.priority_residual_enabled(),
         )
         .await;
 
@@ -431,12 +434,18 @@ impl AdaptiveRuntime {
         hot_cache: Arc<RwLock<HotCache>>,
         agent_id: &str,
         seed_empty_dag_cpm: bool,
+        seed_empty_priority_residual: bool,
     ) {
         let Some(backend) = backend else {
-            if seed_empty_dag_cpm
+            if (seed_empty_dag_cpm || seed_empty_priority_residual)
                 && let Ok(mut guard) = hot_cache.write()
             {
-                guard.dag_cpm = Some(DagCpmState::new(agent_id));
+                if seed_empty_dag_cpm {
+                    guard.dag_cpm = Some(DagCpmState::new(agent_id));
+                }
+                if seed_empty_priority_residual {
+                    guard.priority_residual = Some(PriorityResidualState::new(agent_id));
+                }
             }
             return;
         };
@@ -453,17 +462,32 @@ impl AdaptiveRuntime {
         match backend.load_dag_state(agent_id).await {
             Ok(dag_cpm) => {
                 if let Ok(mut guard) = hot_cache.write() {
-                    guard.dag_cpm = dag_cpm.or_else(|| {
-                        seed_empty_dag_cpm.then(|| DagCpmState::new(agent_id))
-                    });
+                    guard.dag_cpm =
+                        dag_cpm.or_else(|| seed_empty_dag_cpm.then(|| DagCpmState::new(agent_id)));
                 }
             }
             Err(error) => {
                 eprintln!("nemo-flow-adaptive: DAG CPM hot cache seeding failed: {error}");
-                if seed_empty_dag_cpm
-                    && let Ok(mut guard) = hot_cache.write()
-                {
+                if seed_empty_dag_cpm && let Ok(mut guard) = hot_cache.write() {
                     guard.dag_cpm = Some(DagCpmState::new(agent_id));
+                }
+            }
+        }
+
+        match backend.load_priority_residual_state(agent_id).await {
+            Ok(priority_residual) => {
+                if let Ok(mut guard) = hot_cache.write() {
+                    guard.priority_residual = priority_residual.or_else(|| {
+                        seed_empty_priority_residual.then(|| PriorityResidualState::new(agent_id))
+                    });
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "nemo-flow-adaptive: priority residual hot cache seeding failed: {error}"
+                );
+                if seed_empty_priority_residual && let Ok(mut guard) = hot_cache.write() {
+                    guard.priority_residual = Some(PriorityResidualState::new(agent_id));
                 }
             }
         }
@@ -474,6 +498,15 @@ impl AdaptiveRuntime {
             .telemetry
             .as_ref()
             .is_some_and(|config| config.learners.iter().any(|learner| learner == "dag_cpm"))
+    }
+
+    fn priority_residual_enabled(&self) -> bool {
+        self.config.telemetry.as_ref().is_some_and(|config| {
+            config
+                .learners
+                .iter()
+                .any(|learner| learner == "priority_residual")
+        })
     }
 
     fn pending_features(&self, agent_id: &str) -> Vec<Box<dyn AdaptiveFeature>> {
@@ -822,6 +855,7 @@ fn build_learners(
             ))),
             "tool_parallelism" => built.push(Box::new(ToolParallelismLearner::new(agent_id))),
             "dag_cpm" => built.push(Box::new(DagCpmLearner::new(agent_id))),
+            "priority_residual" => built.push(Box::new(PriorityResidualLearner::new(agent_id))),
             "acg" => {
                 if let Some(config) = acg_config {
                     built.push(Box::new(AcgLearner::new(

@@ -6,11 +6,16 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use nemo_flow::codec::request::AnnotatedLlmRequest;
 use nemo_flow::codec::response::FinishReason;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::types::metadata::MetadataEnvelope;
+
+const NEMO_FLOW_INTERNAL_EXTRA_KEY: &str = "_nemo_flow_internal";
+const ADAPTIVE_HINTS_EXTRA_KEY: &str = "adaptive_hints";
 
 /// Compact backend timing extracted from an annotated LLM response.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -58,18 +63,50 @@ pub struct CallAdaptiveHints {
     /// Maximum priority allowed by the structural policy for this call.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub priority_cap: Option<u32>,
-    /// RLS budgeted output sequence length used on the request path.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub predicted_osl: Option<u32>,
-    /// Estimated model service time used for priority/deadline reasoning.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub estimated_service_ms: Option<u64>,
-    /// Workflow SLA visible when the request was issued.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub workflow_sla_ms: Option<u64>,
-    /// Workflow elapsed time visible when the request was issued.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub workflow_elapsed_ms_at_call_start: Option<u64>,
+}
+
+impl CallAdaptiveHints {
+    /// Whether this feedback record contains no learner-update facts.
+    pub fn is_empty(&self) -> bool {
+        self.selected_priority_residual_arm.is_none()
+            && self.selected_priority_residual_key.is_none()
+            && self.emitted_priority.is_none()
+            && self.priority_cap.is_none()
+    }
+}
+
+/// Attach local-only adaptive feedback to an annotated request.
+pub(crate) fn write_call_adaptive_hints(
+    annotated: &mut AnnotatedLlmRequest,
+    hints: &CallAdaptiveHints,
+) {
+    if hints.is_empty() {
+        return;
+    }
+    let Ok(value) = serde_json::to_value(hints) else {
+        return;
+    };
+    let internal = annotated
+        .extra
+        .entry(NEMO_FLOW_INTERNAL_EXTRA_KEY.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(internal) = internal.as_object_mut() else {
+        return;
+    };
+    internal.insert(ADAPTIVE_HINTS_EXTRA_KEY.to_string(), value);
+}
+
+/// Read local-only adaptive feedback from an annotated request.
+pub(crate) fn read_call_adaptive_hints(
+    annotated: &AnnotatedLlmRequest,
+) -> Option<CallAdaptiveHints> {
+    let value = annotated
+        .extra
+        .get(NEMO_FLOW_INTERNAL_EXTRA_KEY)?
+        .as_object()?
+        .get(ADAPTIVE_HINTS_EXTRA_KEY)?;
+    let hints = serde_json::from_value::<CallAdaptiveHints>(value.clone()).ok()?;
+    (!hints.is_empty()).then_some(hints)
 }
 
 /// Kind of runtime call captured in adaptive telemetry.

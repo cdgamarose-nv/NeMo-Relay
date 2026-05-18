@@ -9,7 +9,7 @@ use std::sync::{
 };
 
 use crate::context_helpers::extract_scope_path;
-use crate::types::records::{CallKind, CallRecord};
+use crate::types::records::{CallKind, CallRecord, read_call_adaptive_hints};
 use nemo_flow::api::event::{Event, ScopeCategory};
 use nemo_flow::api::runtime::EventSubscriberFn;
 use nemo_flow::api::scope::ScopeType;
@@ -43,6 +43,9 @@ pub(crate) fn event_to_call_record(event: &Event, scope_path: &[String]) -> Opti
         Some("tool") => (CallKind::Tool, None),
         _ => return None,
     };
+    let adaptive_hints = annotated_request
+        .as_deref()
+        .and_then(read_call_adaptive_hints);
     Some(CallRecord {
         kind,
         name: event.name().to_string(),
@@ -50,6 +53,7 @@ pub(crate) fn event_to_call_record(event: &Event, scope_path: &[String]) -> Opti
         scope_uuid: event.uuid(),
         tool_call_id: event.tool_call_id().map(str::to_string),
         annotated_request,
+        adaptive_hints,
         function_path: scope_path.to_vec(),
         ..CallRecord::default()
     })

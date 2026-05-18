@@ -63,9 +63,12 @@ pub(crate) fn run_request_intercepts_with_codec(
 
     match (codec, intercepted_annotated) {
         (Some(codec), Some(annotated)) => {
-            let mut encoded = codec.encode(&annotated, &original)?;
+            let event_annotated = Arc::new(annotated.clone());
+            let mut encoded_annotated = annotated;
+            encoded_annotated.extra.remove("_nemo_flow_internal");
+            let mut encoded = codec.encode(&encoded_annotated, &original)?;
             encoded.headers = intercepted_request.headers;
-            Ok((encoded, Some(Arc::new(annotated))))
+            Ok((encoded, Some(event_annotated)))
         }
         _ => Ok((intercepted_request, None)),
     }
