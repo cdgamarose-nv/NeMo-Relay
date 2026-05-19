@@ -270,6 +270,7 @@ def scope(
         yield pushed_handle
     finally:
         if pushed_handle is not None:
+            _ensure_scope_stack()
             _native_pop_scope(pushed_handle, timestamp=end_timestamp)
 
 

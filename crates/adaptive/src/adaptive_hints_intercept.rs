@@ -18,21 +18,21 @@ use nemo_flow::codec::request::{AnnotatedLlmRequest, Message};
 use serde_json::{Map, Value};
 
 use crate::context_helpers::{
-    WorkflowClass, extract_scope_path, read_manual_latency_sensitivity, read_workflow_class,
-    resolve_agent_id, resolve_root_scope_uuid,
+    extract_scope_path, read_manual_latency_sensitivity, read_workflow_class, resolve_agent_id,
+    resolve_root_scope_uuid, WorkflowClass,
 };
 use crate::dag::{
-    DEFAULT_DAG_PRIORITY_CAP, DagCpmState, MAX_DAG_PRIORITY_CAP, llm_structural_key,
-    project_priority_prior,
+    llm_structural_key, project_priority_prior, DagCpmState, DEFAULT_DAG_PRIORITY_CAP,
+    MAX_DAG_PRIORITY_CAP,
 };
 use crate::intercepts::AGENT_HINTS_HEADER_KEY;
-use crate::osl_empirical::{OslEmpiricalState, OslRequestSignature, cap_osl_to_request_limit};
+use crate::osl_empirical::{cap_osl_to_request_limit, OslEmpiricalState, OslRequestSignature};
 use crate::priority_residual::PriorityResidualState;
 use crate::trie::builder::SensitivityConfig;
 use crate::trie::lookup::PredictionTrieLookup;
 use crate::types::cache::HotCache;
 use crate::types::metadata::AgentHints;
-use crate::types::records::{CallAdaptiveHints, write_call_adaptive_hints};
+use crate::types::records::{write_call_adaptive_hints, CallAdaptiveHints};
 use uuid::Uuid;
 
 const DEFAULT_PRIORITY_ADJUSTMENT: i32 = 0;
@@ -248,7 +248,8 @@ fn apply_empirical_osl_overlay(
     annotated: Option<&AnnotatedLlmRequest>,
     root_uuid: Option<Uuid>,
     model_name: &str,
-    effective_agent_id: &str,
+    state_agent_id: &str,
+    hint_prefix_agent_id: &str,
     scope_depth: usize,
 ) -> HintSelection {
     let Some(empirical_state) = empirical_state else {
@@ -257,8 +258,7 @@ fn apply_empirical_osl_overlay(
 
     let predicted_osl = annotated.and_then(|request| {
         let signature = OslRequestSignature::from_request(request);
-        let mut outcome =
-            empirical_state.predict(root_uuid, effective_agent_id, model_name, signature);
+        let mut outcome = empirical_state.predict(root_uuid, state_agent_id, model_name, signature);
         if let Some(prediction) = outcome.emitted_osl {
             outcome.emitted_osl = Some(cap_osl_to_request_limit(prediction, request));
         }
@@ -279,7 +279,7 @@ fn apply_empirical_osl_overlay(
         (Some(hints), Some(osl)) => hints.osl = Some(osl),
         (Some(hints), None) => hints.osl = None,
         (None, Some(osl)) => {
-            selection.hints = Some(osl_only_agent_hints(osl, effective_agent_id, scope_depth));
+            selection.hints = Some(osl_only_agent_hints(osl, hint_prefix_agent_id, scope_depth));
         }
         (None, None) => {}
     }
@@ -363,9 +363,24 @@ fn ensure_dynamo_timing_field(nvext: &mut Map<String, Value>) {
     }
 }
 
-fn write_agent_hints_to_nvext(body: &mut Map<String, Value>, serialized_hints: Value) {
+fn request_dynamo_timing_in_body(body: &mut Map<String, Value>) {
     if let Some(nvext) = ensure_nvext_object(body) {
         ensure_dynamo_timing_field(nvext);
+    }
+}
+
+fn request_dynamo_timing(request: &mut LlmRequest) {
+    if let Some(body) = request.content.as_object_mut() {
+        request_dynamo_timing_in_body(body);
+    }
+}
+
+fn request_dynamo_timing_annotated(annotated: &mut AnnotatedLlmRequest) {
+    request_dynamo_timing_in_body(&mut annotated.extra);
+}
+
+fn write_agent_hints_to_nvext(body: &mut Map<String, Value>, serialized_hints: Value) {
+    if let Some(nvext) = ensure_nvext_object(body) {
         nvext.insert("agent_hints".to_string(), serialized_hints);
     }
 }
@@ -391,6 +406,23 @@ fn inject_agent_hints_annotated(annotated: &mut AnnotatedLlmRequest, hints: &Age
     };
 
     write_agent_hints_to_nvext(&mut annotated.extra, serialized_hints);
+}
+
+fn clear_priority_residual_feedback(feedback: &mut CallAdaptiveHints) {
+    feedback.selected_priority_residual_arm = None;
+    feedback.selected_priority_residual_key = None;
+}
+
+fn record_emitted_hint_facts(
+    feedback: &mut CallAdaptiveHints,
+    hints: &AgentHints,
+    priority_cap: u32,
+) {
+    if hints.priority >= 0 {
+        feedback.emitted_priority = Some(hints.priority as u32);
+        feedback.priority_cap = Some(priority_cap.min(MAX_DAG_PRIORITY_CAP));
+    }
+    feedback.emitted_osl = hints.osl;
 }
 
 /// Opt-in LLM request intercept that injects [`AgentHints`] into request
@@ -472,6 +504,7 @@ impl AdaptiveHintsIntercept {
             annotated,
             root_uuid,
             model_name,
+            &self.agent_id,
             effective_agent_id,
             scope_depth,
         )
@@ -514,21 +547,27 @@ impl AdaptiveHintsIntercept {
                     scope_depth,
                 );
 
-                if let Some(hints) = final_hints {
+                request_dynamo_timing(&mut request);
+                if let Some(annotated) = annotated.as_mut() {
+                    request_dynamo_timing_annotated(annotated);
+                }
+
+                if let Some(hints) = final_hints.as_ref() {
                     inject_agent_hints(&mut request, &hints);
                     if let Some(annotated) = annotated.as_mut() {
                         inject_agent_hints_annotated(annotated, &hints);
                     }
                 }
 
-                if let Some(feedback) = selection.feedback.as_ref()
-                    && let Some(annotated) = annotated.as_mut()
-                {
-                    if manual_ls.is_none() {
-                        write_call_adaptive_hints(annotated, feedback);
-                    } else {
-                        write_call_adaptive_hints(annotated, &feedback.only_osl_feedback());
+                if let Some(annotated) = annotated.as_mut() {
+                    let mut feedback = selection.feedback.take().unwrap_or_default();
+                    if manual_ls.is_some() {
+                        clear_priority_residual_feedback(&mut feedback);
                     }
+                    if let Some(hints) = final_hints.as_ref() {
+                        record_emitted_hint_facts(&mut feedback, hints, priority_cap);
+                    }
+                    write_call_adaptive_hints(annotated, &feedback);
                 }
 
                 Ok((request, annotated))

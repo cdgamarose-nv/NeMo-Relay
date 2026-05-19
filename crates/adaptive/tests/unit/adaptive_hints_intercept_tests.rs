@@ -319,6 +319,11 @@ fn test_adaptive_hints_intercept_injects_prediction_hints_and_manual_override() 
         returned_annotated.extra["nvext"]["extra_fields"],
         serde_json::json!(["timing"])
     );
+    let adaptive_hints =
+        &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
+    assert_eq!(adaptive_hints["emitted_priority"], serde_json::json!(0));
+    assert_eq!(adaptive_hints["priority_cap"], serde_json::json!(3));
+    assert_eq!(adaptive_hints["emitted_osl"], serde_json::json!(150));
     assert_eq!(returned_annotated.messages, annotated.messages);
 
     pop_scope(
@@ -418,15 +423,13 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
         None,
     )
     .unwrap();
-    assert!(
-        poisoned_request
-            .headers
-            .get(AGENT_HINTS_HEADER_KEY)
-            .is_none()
-    );
+    assert!(poisoned_request
+        .headers
+        .get(AGENT_HINTS_HEADER_KEY)
+        .is_none());
     assert_eq!(
         poisoned_request.content,
-        serde_json::json!({"existing": true})
+        serde_json::json!({"existing": true, "nvext": {"extra_fields": ["timing"]}})
     );
 
     reset_root_metadata();
@@ -604,8 +607,20 @@ fn test_adaptive_hints_intercept_records_omitted_empirical_osl_without_emitting_
     )
     .unwrap();
 
-    assert!(request.content.get("nvext").is_none());
+    assert_eq!(
+        request.content["nvext"]["extra_fields"],
+        serde_json::json!(["timing"])
+    );
+    assert!(request.content["nvext"].get("agent_hints").is_none());
     let returned_annotated = returned_annotated.unwrap();
+    assert_eq!(
+        returned_annotated.extra["nvext"]["extra_fields"],
+        serde_json::json!(["timing"])
+    );
+    assert!(returned_annotated.extra["nvext"]
+        .as_object()
+        .and_then(|nvext| nvext.get("agent_hints"))
+        .is_none());
     let adaptive_hints =
         &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
     assert_eq!(
@@ -669,6 +684,74 @@ fn test_adaptive_hints_intercept_empirical_osl_can_emit_without_other_hints() {
         serde_json::json!("fallback-agent-d0")
     );
 
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_uses_registered_agent_for_workflow_osl_lookup() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let annotated = annotated_with_messages(vec![Message::User {
+        content: MessageContent::Text("hello".into()),
+        name: None,
+    }]);
+    let osl_empirical = empirical_state_with_samples(
+        "aiq-eval-chat",
+        &annotated,
+        [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+    );
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: None,
+        priority_residual: None,
+        osl_empirical: Some(osl_empirical),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "aiq-eval-chat".to_string()).into_request_fn();
+
+    let agent_scope = push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("aiq.chat")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+
+    let (request, returned_annotated) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        Some(annotated),
+    )
+    .unwrap();
+
+    let body_hints = &request.content["nvext"]["agent_hints"];
+    assert_eq!(body_hints["osl"], serde_json::json!(90));
+    assert_eq!(body_hints["prefix_id"], serde_json::json!("aiq.chat-d1"));
+    let returned_annotated = returned_annotated.unwrap();
+    let adaptive_hints =
+        &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
+    assert_eq!(
+        adaptive_hints["selected_osl_source"],
+        serde_json::json!("workflow")
+    );
+    assert_eq!(adaptive_hints["emitted_osl"], serde_json::json!(90));
+
+    pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&agent_scope.uuid)
+            .build(),
+    )
+    .unwrap();
     reset_root_metadata();
 }
 

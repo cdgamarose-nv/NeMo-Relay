@@ -89,17 +89,6 @@ impl CallAdaptiveHints {
             && self.osl_confidence_passed.is_none()
             && self.osl_sample_count.is_none()
     }
-
-    /// Returns only OSL diagnostics, dropping priority residual feedback.
-    pub(crate) fn only_osl_feedback(&self) -> Self {
-        Self {
-            selected_osl_source: self.selected_osl_source.clone(),
-            emitted_osl: self.emitted_osl,
-            osl_confidence_passed: self.osl_confidence_passed,
-            osl_sample_count: self.osl_sample_count,
-            ..Self::default()
-        }
-    }
 }
 
 /// Attach local-only adaptive feedback to an annotated request.

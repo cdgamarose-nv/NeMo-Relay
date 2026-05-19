@@ -45,6 +45,30 @@ def test_get_scope_stack_different_across_tasks():
     assert results["a"] != results["b"], "Tasks should have different scope stacks"
 
 
+def test_scope_context_manager_resyncs_before_pop_across_tasks():
+    """A scope should pop from its task's stack even after another task runs."""
+
+    async def task_a(entered_a: asyncio.Event, entered_b: asyncio.Event) -> None:
+        nemo_flow._scope_stack_var.set(nemo_flow.create_scope_stack())
+        with nemo_flow.scope.scope("task-a", nemo_flow.ScopeType.Agent):
+            entered_a.set()
+            await entered_b.wait()
+
+    async def task_b(entered_a: asyncio.Event, entered_b: asyncio.Event) -> None:
+        await entered_a.wait()
+        nemo_flow._scope_stack_var.set(nemo_flow.create_scope_stack())
+        with nemo_flow.scope.scope("task-b", nemo_flow.ScopeType.Agent):
+            entered_b.set()
+            await asyncio.sleep(0)
+
+    async def main() -> None:
+        entered_a = asyncio.Event()
+        entered_b = asyncio.Event()
+        await asyncio.gather(task_a(entered_a, entered_b), task_b(entered_a, entered_b))
+
+    asyncio.run(main())
+
+
 def test_scope_stack_repr():
     """ScopeStack has a meaningful repr."""
     stack = nemo_flow.create_scope_stack()
