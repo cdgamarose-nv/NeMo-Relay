@@ -303,10 +303,23 @@ fn test_adaptive_hints_intercept_injects_prediction_hints_and_manual_override() 
     assert_eq!(body_hints["prefix_id"], serde_json::json!("scope-agent-d2"));
     assert_eq!(body_hints["total_requests"], serde_json::json!(6));
     assert_eq!(
-        request.headers.get(AGENT_HINTS_HEADER_KEY).unwrap(),
-        body_hints
+        request.content["nvext"]["extra_fields"],
+        serde_json::json!(["timing"])
     );
-    assert_eq!(returned_annotated, Some(annotated));
+    assert_eq!(
+        request.headers.get(AGENT_HINTS_HEADER_KEY).unwrap(),
+        &serde_json::Value::String(body_hints.to_string())
+    );
+    let returned_annotated = returned_annotated.unwrap();
+    assert_eq!(
+        returned_annotated.extra["nvext"]["agent_hints"],
+        *body_hints
+    );
+    assert_eq!(
+        returned_annotated.extra["nvext"]["extra_fields"],
+        serde_json::json!(["timing"])
+    );
+    assert_eq!(returned_annotated.messages, annotated.messages);
 
     pop_scope(
         nemo_flow::api::scope::PopScopeParams::builder()
@@ -361,11 +374,17 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
     .unwrap();
     assert_eq!(
         request.headers.get(AGENT_HINTS_HEADER_KEY),
-        Some(&serde_json::to_value(&defaults).unwrap())
+        Some(&serde_json::Value::String(
+            serde_json::to_value(&defaults).unwrap().to_string()
+        ))
     );
     assert_eq!(
         request.content["nvext"]["agent_hints"]["prefix_id"],
         "defaults"
+    );
+    assert_eq!(
+        request.content["nvext"]["extra_fields"],
+        serde_json::json!(["timing"])
     );
     assert!(annotated.is_none());
 
@@ -1188,6 +1207,8 @@ fn test_apply_manual_latency_override_and_inject_agent_hints_cover_manual_paths(
     inject_agent_hints(&mut non_object_request, &manual_only);
     assert_eq!(
         non_object_request.headers.get(AGENT_HINTS_HEADER_KEY),
-        Some(&serde_json::to_value(&manual_only).unwrap())
+        Some(&serde_json::Value::String(
+            serde_json::to_value(&manual_only).unwrap().to_string()
+        ))
     );
 }

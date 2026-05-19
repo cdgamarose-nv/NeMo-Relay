@@ -15,6 +15,7 @@ use std::sync::{Arc, RwLock};
 use nemo_flow::api::llm::LlmRequest;
 use nemo_flow::api::runtime::LlmRequestInterceptFn;
 use nemo_flow::codec::request::{AnnotatedLlmRequest, Message};
+use serde_json::{Map, Value};
 
 use crate::context_helpers::{
     WorkflowClass, extract_scope_path, read_manual_latency_sensitivity, read_workflow_class,
@@ -35,6 +36,7 @@ use crate::types::records::{CallAdaptiveHints, write_call_adaptive_hints};
 use uuid::Uuid;
 
 const DEFAULT_PRIORITY_ADJUSTMENT: i32 = 0;
+const DYNAMO_TIMING_EXTRA_FIELD: &str = "timing";
 
 #[derive(Debug, Default)]
 struct HintSelection {
@@ -332,29 +334,63 @@ fn manual_agent_hints(manual: u32, effective_agent_id: &str, scope_depth: usize)
     }
 }
 
+fn ensure_nvext_object(body: &mut Map<String, Value>) -> Option<&mut Map<String, Value>> {
+    if !body.contains_key("nvext") {
+        body.insert("nvext".to_string(), Value::Object(Map::new()));
+    }
+    body.get_mut("nvext").and_then(Value::as_object_mut)
+}
+
+fn ensure_dynamo_timing_field(nvext: &mut Map<String, Value>) {
+    match nvext.get_mut("extra_fields") {
+        Some(Value::Array(fields)) => {
+            let has_timing = fields
+                .iter()
+                .any(|field| field.as_str() == Some(DYNAMO_TIMING_EXTRA_FIELD));
+            if !has_timing {
+                fields.push(Value::String(DYNAMO_TIMING_EXTRA_FIELD.to_string()));
+            }
+        }
+        Some(value) => {
+            *value = Value::Array(vec![Value::String(DYNAMO_TIMING_EXTRA_FIELD.to_string())]);
+        }
+        None => {
+            nvext.insert(
+                "extra_fields".to_string(),
+                Value::Array(vec![Value::String(DYNAMO_TIMING_EXTRA_FIELD.to_string())]),
+            );
+        }
+    }
+}
+
+fn write_agent_hints_to_nvext(body: &mut Map<String, Value>, serialized_hints: Value) {
+    if let Some(nvext) = ensure_nvext_object(body) {
+        ensure_dynamo_timing_field(nvext);
+        nvext.insert("agent_hints".to_string(), serialized_hints);
+    }
+}
+
 fn inject_agent_hints(request: &mut LlmRequest, hints: &AgentHints) {
     let Ok(serialized_hints) = serde_json::to_value(hints) else {
         return;
     };
 
     if let Some(body) = request.content.as_object_mut() {
-        if !body.contains_key("nvext") {
-            body.insert(
-                "nvext".to_string(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-        }
-        if let Some(nvext) = body
-            .get_mut("nvext")
-            .and_then(|value| value.as_object_mut())
-        {
-            nvext.insert("agent_hints".to_string(), serialized_hints.clone());
-        }
+        write_agent_hints_to_nvext(body, serialized_hints.clone());
     }
 
-    request
-        .headers
-        .insert(AGENT_HINTS_HEADER_KEY.to_string(), serialized_hints);
+    request.headers.insert(
+        AGENT_HINTS_HEADER_KEY.to_string(),
+        Value::String(serialized_hints.to_string()),
+    );
+}
+
+fn inject_agent_hints_annotated(annotated: &mut AnnotatedLlmRequest, hints: &AgentHints) {
+    let Ok(serialized_hints) = serde_json::to_value(hints) else {
+        return;
+    };
+
+    write_agent_hints_to_nvext(&mut annotated.extra, serialized_hints);
 }
 
 /// Opt-in LLM request intercept that injects [`AgentHints`] into request
@@ -480,6 +516,9 @@ impl AdaptiveHintsIntercept {
 
                 if let Some(hints) = final_hints {
                     inject_agent_hints(&mut request, &hints);
+                    if let Some(annotated) = annotated.as_mut() {
+                        inject_agent_hints_annotated(annotated, &hints);
+                    }
                 }
 
                 if let Some(feedback) = selection.feedback.as_ref()

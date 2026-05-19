@@ -2,14 +2,40 @@ diff --git a/libs/ai-endpoints/langchain_nvidia_ai_endpoints/chat_models.py b/li
 index 07df9ab..4525133 100644
 --- a/libs/ai-endpoints/langchain_nvidia_ai_endpoints/chat_models.py
 +++ b/libs/ai-endpoints/langchain_nvidia_ai_endpoints/chat_models.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import base64
+ import enum
++import json
+ import logging
+ import os
+ import re
 @@ -56,6 +56,7 @@ from langchain_core.utils.pydantic import is_basemodel_subclass
  from langchain_core.utils.utils import _build_model_kwargs
  from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
-
+ 
 +from langchain_nvidia_ai_endpoints import _nemo_flow
  from langchain_nvidia_ai_endpoints._common import _NVIDIAClient
  from langchain_nvidia_ai_endpoints._statics import Model
  from langchain_nvidia_ai_endpoints._utils import convert_message_to_dict
+@@ -290,6 +292,17 @@ def _is_structured_output(payload: dict) -> bool:
+     return False
+ 
+ 
++def _as_json_dict(response: Any) -> dict:
++    if isinstance(response, dict):
++        return response
++    return json.loads(response)
++
++
++def _postprocess_json_response(client: Any, response: dict) -> dict:
++    processed, _ = client.postprocess(json.dumps(response))
++    return processed
++
++
+ def _nv_vlm_get_asset_ids(
+     content: Union[str, List[Union[str, Dict[str, Any]]]],
+ ) -> List[str]:
 @@ -725,9 +726,32 @@ class ChatNVIDIA(BaseChatModel):
          _, payload, extra_headers = self._prepare_inputs_and_payload(
              messages, stop, stream=False, **kwargs
@@ -23,12 +49,12 @@ index 07df9ab..4525133 100644
 +                raw = await self._client.aget_req(
 +                    payload=req.content, extra_headers=dict(req.headers)
 +                )
-+                resp, _ = self._client.postprocess(raw)
-+                return resp
++                return _as_json_dict(raw)
 +
-+            resp_dict = _nemo_flow.run_sync(
++            raw_resp = _nemo_flow.run_sync(
 +                _nemo_flow.llm_execute(self.model, request, _call)
 +            )
++            resp_dict = _postprocess_json_response(self._client, raw_resp)
 +            self._set_callback_out(resp_dict, run_manager)
 +            parsed = self._custom_postprocess(
 +                resp_dict, streaming=False, structured_output=structured_output
@@ -100,10 +126,10 @@ index 07df9ab..4525133 100644
 +                raw = await self._client.aget_req(
 +                    payload=req.content, extra_headers=dict(req.headers)
 +                )
-+                resp, _ = self._client.postprocess(raw)
-+                return resp
++                return _as_json_dict(raw)
 +
-+            resp_dict = await _nemo_flow.llm_execute(self.model, request, _call)
++            raw_resp = await _nemo_flow.llm_execute(self.model, request, _call)
++            resp_dict = _postprocess_json_response(self._client, raw_resp)
 +            self._set_callback_out(resp_dict, run_manager)
 +            parsed = self._custom_postprocess(
 +                resp_dict, streaming=False, structured_output=structured_output
