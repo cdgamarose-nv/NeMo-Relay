@@ -43,7 +43,7 @@ use crate::error::{AdaptiveError, Result};
 use crate::intercepts::create_tool_execution_intercept_with_mode;
 use crate::learner::latency::LatencySensitivityLearner;
 use crate::learner::traits::Learner;
-use crate::osl_empirical::OslEmpiricalState;
+use crate::osl_empirical::{OslEmpiricalLearner, OslEmpiricalState};
 use crate::priority_residual::{PriorityResidualLearner, PriorityResidualState};
 use crate::runtime::backend::build_backend;
 use crate::runtime::validation::validate_config;
@@ -888,6 +888,7 @@ fn build_learners(
             "tool_parallelism" => built.push(Box::new(ToolParallelismLearner::new(agent_id))),
             "dag_cpm" => built.push(Box::new(DagCpmLearner::new(agent_id))),
             "priority_residual" => built.push(Box::new(PriorityResidualLearner::new(agent_id))),
+            "osl_empirical" => built.push(Box::new(OslEmpiricalLearner::new(agent_id))),
             "acg" => {
                 if let Some(config) = acg_config {
                     built.push(Box::new(AcgLearner::new(

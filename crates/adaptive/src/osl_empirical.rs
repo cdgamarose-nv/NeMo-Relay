@@ -4,11 +4,20 @@
 //! Online empirical OSL learner state and request-signature types.
 
 use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use nemo_flow::codec::request::{AnnotatedLlmRequest, Message};
+use nemo_flow::codec::response::FinishReason;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::error::{AdaptiveError, Result};
+use crate::learner::traits::Learner;
+use crate::storage::traits::StorageBackendDyn;
+use crate::types::cache::HotCache;
+use crate::types::records::{CallKind, CallRecord, RunRecord};
 
 /// Maximum retained output-token samples per empirical OSL context.
 pub const MAX_SAMPLES_PER_CONTEXT: usize = 128;
@@ -298,6 +307,127 @@ impl OslEmpiricalState {
             run_contexts: HashMap::new(),
         }
     }
+
+    fn observe_context(
+        &mut self,
+        key: OslContextKey,
+        output_tokens: u32,
+        observed_at: DateTime<Utc>,
+    ) {
+        self.contexts
+            .entry(key.storage_key())
+            .or_default()
+            .observe(output_tokens, observed_at);
+    }
+}
+
+/// Learner that stores empirical output-token samples from completed runs.
+pub struct OslEmpiricalLearner {
+    agent_id: String,
+}
+
+impl OslEmpiricalLearner {
+    /// Create an empirical OSL learner for one agent/workflow.
+    pub fn new(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+        }
+    }
+}
+
+impl Learner for OslEmpiricalLearner {
+    fn process_run<'a>(
+        &'a self,
+        run: &'a RunRecord,
+        backend: &'a dyn StorageBackendDyn,
+        hot_cache: &'a Arc<RwLock<HotCache>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut state = backend
+                .load_osl_empirical_state(&self.agent_id)
+                .await?
+                .unwrap_or_else(|| OslEmpiricalState::new(&self.agent_id));
+            state.agent_id = self.agent_id.clone();
+
+            let mut observed = 0usize;
+            for call in &run.calls {
+                if let Some(sample) = completed_call_sample(&self.agent_id, call, run.ended_at) {
+                    state.observe_context(
+                        sample.workflow_key,
+                        sample.output_tokens,
+                        sample.observed_at,
+                    );
+                    state.observe_context(
+                        sample.global_key,
+                        sample.output_tokens,
+                        sample.observed_at,
+                    );
+                    observed += 1;
+                }
+            }
+
+            if observed == 0 {
+                return Ok(());
+            }
+
+            backend
+                .store_osl_empirical_state(&self.agent_id, &state)
+                .await?;
+            let mut guard = hot_cache.write().map_err(|error| {
+                AdaptiveError::Internal(format!("hot cache lock poisoned: {error}"))
+            })?;
+            guard.osl_empirical = Some(state);
+
+            Ok(())
+        })
+    }
+}
+
+struct CompletedCallSample {
+    output_tokens: u32,
+    observed_at: DateTime<Utc>,
+    workflow_key: OslContextKey,
+    global_key: OslContextKey,
+}
+
+fn completed_call_sample(
+    agent_id: &str,
+    call: &CallRecord,
+    run_ended_at: Option<DateTime<Utc>>,
+) -> Option<CompletedCallSample> {
+    if call.kind != CallKind::Llm {
+        return None;
+    }
+    if matches!(call.finish_reason.as_ref(), Some(FinishReason::Length)) {
+        return None;
+    }
+
+    let output_tokens = call.output_tokens?;
+    let request = call.annotated_request.as_deref()?;
+    let model = request
+        .model
+        .as_deref()
+        .or(call.model_name.as_deref())?
+        .to_string();
+    let signature = OslRequestSignature::from_request(request);
+    let observed_at = call.ended_at.or(run_ended_at).unwrap_or_else(Utc::now);
+
+    Some(CompletedCallSample {
+        output_tokens,
+        observed_at,
+        workflow_key: OslContextKey {
+            scope: OslContextScope::Workflow {
+                agent_id: agent_id.to_string(),
+            },
+            model: model.clone(),
+            signature,
+        },
+        global_key: OslContextKey {
+            scope: OslContextScope::Global,
+            model,
+            signature,
+        },
+    })
 }
 
 #[cfg(test)]

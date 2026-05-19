@@ -132,11 +132,12 @@ fn build_learners_filters_unknown_entries() {
             "latency_sensitivity".to_string(),
             "dag_cpm".to_string(),
             "priority_residual".to_string(),
+            "osl_empirical".to_string(),
             "unknown".to_string(),
         ],
         None,
     );
-    assert_eq!(learners.len(), 3);
+    assert_eq!(learners.len(), 4);
 }
 
 #[tokio::test(flavor = "current_thread")]

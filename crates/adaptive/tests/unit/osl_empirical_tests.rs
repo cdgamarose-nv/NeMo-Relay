@@ -2,16 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
 
 use chrono::{TimeZone, Utc};
 use nemo_flow::codec::request::{
     AnnotatedLlmRequest, FunctionDefinition, Message, MessageContent, ToolDefinition,
 };
+use nemo_flow::codec::response::FinishReason;
 use uuid::Uuid;
 
+use crate::learner::traits::Learner;
+use crate::storage::memory::InMemoryBackend;
+use crate::storage::traits::StorageBackendDyn;
+use crate::types::cache::HotCache;
+use crate::types::records::{CallKind, CallRecord, RunRecord};
+
 use super::{
-    OSL_MAX_SPREAD_MULTIPLIER, OslContextKey, OslContextScope, OslContextStats, OslEmpiricalState,
-    OslMessageRole, OslRequestSignature,
+    OSL_MAX_SPREAD_MULTIPLIER, OslContextKey, OslContextScope, OslContextStats,
+    OslEmpiricalLearner, OslEmpiricalState, OslMessageRole, OslRequestSignature,
 };
 
 fn request(messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> AnnotatedLlmRequest {
@@ -46,6 +54,49 @@ fn tool_definition() -> ToolDefinition {
             description: None,
             parameters: None,
         },
+    }
+}
+
+fn empty_hot_cache() -> Arc<RwLock<HotCache>> {
+    Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: None,
+        priority_residual: None,
+        osl_empirical: None,
+        acg_profiles: std::collections::HashMap::new(),
+        acg_profile_observation_counts: std::collections::HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }))
+}
+
+fn llm_call(
+    output_tokens: Option<u32>,
+    annotated_request: Option<AnnotatedLlmRequest>,
+) -> CallRecord {
+    let now = Utc.timestamp_millis_opt(1000).single().unwrap();
+    CallRecord {
+        kind: CallKind::Llm,
+        name: "llm".to_string(),
+        started_at: now,
+        ended_at: Some(now),
+        output_tokens,
+        model_name: Some("model-a".to_string()),
+        annotated_request: annotated_request.map(Arc::new),
+        ..Default::default()
+    }
+}
+
+fn sample_run(calls: Vec<CallRecord>) -> RunRecord {
+    let now = Utc.timestamp_millis_opt(2000).single().unwrap();
+    RunRecord {
+        id: Uuid::now_v7(),
+        agent_id: "agent-a".to_string(),
+        calls,
+        started_at: now,
+        ended_at: Some(now),
     }
 }
 
@@ -259,4 +310,119 @@ fn observe_with_zero_limit_retains_no_samples() {
 
     assert_eq!(stats.sample_count(), 0);
     assert_eq!(stats.last_updated_at, Some(observed_at));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn empirical_learner_persists_workflow_and_global_contexts() {
+    let backend = InMemoryBackend::new();
+    let hot_cache = empty_hot_cache();
+    let learner = OslEmpiricalLearner::new("agent-a");
+    let req = request(
+        vec![Message::User {
+            content: MessageContent::Text("question".to_string()),
+            name: None,
+        }],
+        Some(vec![tool_definition()]),
+    );
+    let signature = OslRequestSignature::from_request(&req);
+    let run = sample_run(vec![
+        llm_call(Some(100), Some(req.clone())),
+        llm_call(Some(180), Some(req)),
+    ]);
+
+    learner
+        .process_run(&run, &backend, &hot_cache)
+        .await
+        .unwrap();
+
+    let state = backend
+        .load_osl_empirical_state("agent-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow_key = OslContextKey {
+        scope: OslContextScope::Workflow {
+            agent_id: "agent-a".to_string(),
+        },
+        model: "model-a".to_string(),
+        signature,
+    }
+    .storage_key();
+    let global_key = OslContextKey {
+        scope: OslContextScope::Global,
+        model: "model-a".to_string(),
+        signature,
+    }
+    .storage_key();
+
+    assert_eq!(
+        state.contexts[&workflow_key].samples,
+        VecDeque::from([100, 180])
+    );
+    assert_eq!(
+        state.contexts[&global_key].samples,
+        VecDeque::from([100, 180])
+    );
+    assert_eq!(
+        hot_cache
+            .read()
+            .unwrap()
+            .osl_empirical
+            .as_ref()
+            .unwrap()
+            .contexts[&workflow_key]
+            .samples,
+        VecDeque::from([100, 180])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn empirical_learner_skips_invalid_completed_call_samples() {
+    let backend = InMemoryBackend::new();
+    let hot_cache = empty_hot_cache();
+    let learner = OslEmpiricalLearner::new("agent-a");
+    let valid_req = request(
+        vec![Message::User {
+            content: MessageContent::Text("question".to_string()),
+            name: None,
+        }],
+        None,
+    );
+    let mut no_model_req = valid_req.clone();
+    no_model_req.model = None;
+    let mut length_call = llm_call(Some(300), Some(valid_req.clone()));
+    length_call.finish_reason = Some(FinishReason::Length);
+
+    let run = sample_run(vec![
+        llm_call(Some(120), Some(valid_req)),
+        llm_call(None, Some(request(vec![], None))),
+        llm_call(Some(200), None),
+        CallRecord {
+            model_name: None,
+            ..llm_call(Some(220), Some(no_model_req))
+        },
+        length_call,
+        CallRecord {
+            kind: CallKind::Tool,
+            ..llm_call(Some(500), Some(request(vec![], None)))
+        },
+    ]);
+
+    learner
+        .process_run(&run, &backend, &hot_cache)
+        .await
+        .unwrap();
+
+    let state = backend
+        .load_osl_empirical_state("agent-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut retained_samples: Vec<u32> = state
+        .contexts
+        .values()
+        .flat_map(|stats| stats.samples.iter().copied())
+        .collect();
+    retained_samples.sort_unstable();
+    assert_eq!(retained_samples, vec![120, 120]);
 }
