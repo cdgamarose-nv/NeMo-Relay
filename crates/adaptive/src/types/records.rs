@@ -63,6 +63,18 @@ pub struct CallAdaptiveHints {
     /// Maximum priority allowed by the structural policy for this call.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub priority_cap: Option<u32>,
+    /// Empirical OSL source selected on the request path, when empirical OSL is enabled.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub selected_osl_source: Option<String>,
+    /// Final OSL emitted to the backend after request caps, when present.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub emitted_osl: Option<u32>,
+    /// Whether the selected empirical OSL context passed confidence.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub osl_confidence_passed: Option<bool>,
+    /// Number of samples in the selected empirical OSL context.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub osl_sample_count: Option<u32>,
 }
 
 impl CallAdaptiveHints {
@@ -72,6 +84,21 @@ impl CallAdaptiveHints {
             && self.selected_priority_residual_key.is_none()
             && self.emitted_priority.is_none()
             && self.priority_cap.is_none()
+            && self.selected_osl_source.is_none()
+            && self.emitted_osl.is_none()
+            && self.osl_confidence_passed.is_none()
+            && self.osl_sample_count.is_none()
+    }
+
+    /// Returns only OSL diagnostics, dropping priority residual feedback.
+    pub(crate) fn only_osl_feedback(&self) -> Self {
+        Self {
+            selected_osl_source: self.selected_osl_source.clone(),
+            emitted_osl: self.emitted_osl,
+            osl_confidence_passed: self.osl_confidence_passed,
+            osl_sample_count: self.osl_sample_count,
+            ..Self::default()
+        }
     }
 }
 

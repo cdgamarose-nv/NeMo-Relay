@@ -21,6 +21,10 @@ use crate::types::records::{CallKind, CallRecord, RunRecord};
 
 /// Maximum retained output-token samples per empirical OSL context.
 pub const MAX_SAMPLES_PER_CONTEXT: usize = 128;
+/// Maximum retained persistent empirical OSL contexts.
+pub const MAX_PERSISTENT_CONTEXTS: usize = 4096;
+/// Maximum retained temporary run-local empirical OSL contexts.
+pub const MAX_RUN_CONTEXTS: usize = 4096;
 /// Minimum samples before run-local empirical OSL can emit.
 pub const RUN_MIN_SAMPLES: usize = 3;
 /// Minimum samples before persistent empirical OSL can emit.
@@ -33,6 +37,19 @@ pub const OSL_SPREAD_LOW_PERCENTILE: u32 = 50;
 pub const OSL_SPREAD_HIGH_PERCENTILE: u32 = 90;
 /// Maximum allowed ratio between p90 and p50, represented as an integer multiplier.
 pub const OSL_MAX_SPREAD_MULTIPLIER: u32 = 4;
+
+/// Hot-path empirical OSL prediction result and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OslPredictionOutcome {
+    /// Selected context source: `run_local`, `workflow`, `global`, or `none`.
+    pub source: &'static str,
+    /// OSL to emit when confidence passed.
+    pub emitted_osl: Option<u32>,
+    /// Whether the selected context passed confidence.
+    pub confidence_passed: bool,
+    /// Sample count for the selected context, when one existed.
+    pub sample_count: Option<u32>,
+}
 
 /// Message role used in the empirical OSL request signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -318,6 +335,7 @@ impl OslEmpiricalState {
             .entry(key.storage_key())
             .or_default()
             .observe(output_tokens, observed_at);
+        prune_oldest_contexts(&mut self.contexts, MAX_PERSISTENT_CONTEXTS);
     }
 
     fn observe_run_context(
@@ -338,6 +356,7 @@ impl OslEmpiricalState {
             .entry(key)
             .or_default()
             .observe(output_tokens, observed_at);
+        prune_oldest_contexts(&mut self.run_contexts, MAX_RUN_CONTEXTS);
     }
 
     /// Observe one completed LLM call into temporary run-local OSL history.
@@ -360,25 +379,22 @@ impl OslEmpiricalState {
         root_uuid: Uuid,
         model: &str,
         signature: OslRequestSignature,
-    ) -> Option<u32> {
+    ) -> Option<&OslContextStats> {
         let key = OslContextKey {
             scope: OslContextScope::Run { root_uuid },
             model: model.to_string(),
             signature,
         }
         .storage_key();
-        self.run_contexts
-            .get(&key)
-            .and_then(|stats| stats.predict_p85(RUN_MIN_SAMPLES))
+        self.run_contexts.get(&key)
     }
 
-    /// Predict persistent empirical OSL from workflow history, then global history.
-    fn predict_persistent(
+    fn workflow_stats(
         &self,
         agent_id: &str,
         model: &str,
         signature: OslRequestSignature,
-    ) -> Option<u32> {
+    ) -> Option<&OslContextStats> {
         let workflow_key = OslContextKey {
             scope: OslContextScope::Workflow {
                 agent_id: agent_id.to_string(),
@@ -387,20 +403,21 @@ impl OslEmpiricalState {
             signature,
         }
         .storage_key();
-        self.contexts
-            .get(&workflow_key)
-            .and_then(|stats| stats.predict_p85(PERSISTENT_MIN_SAMPLES))
-            .or_else(|| {
-                let global_key = OslContextKey {
-                    scope: OslContextScope::Global,
-                    model: model.to_string(),
-                    signature,
-                }
-                .storage_key();
-                self.contexts
-                    .get(&global_key)
-                    .and_then(|stats| stats.predict_p85(PERSISTENT_MIN_SAMPLES))
-            })
+        self.contexts.get(&workflow_key)
+    }
+
+    fn global_stats(
+        &self,
+        model: &str,
+        signature: OslRequestSignature,
+    ) -> Option<&OslContextStats> {
+        let global_key = OslContextKey {
+            scope: OslContextScope::Global,
+            model: model.to_string(),
+            signature,
+        }
+        .storage_key();
+        self.contexts.get(&global_key)
     }
 
     /// Predict empirical OSL from active run history, then persistent history.
@@ -410,16 +427,89 @@ impl OslEmpiricalState {
         agent_id: &str,
         model: &str,
         signature: OslRequestSignature,
-    ) -> Option<u32> {
-        root_uuid
-            .and_then(|root_uuid| self.predict_run_local(root_uuid, model, signature))
-            .or_else(|| self.predict_persistent(agent_id, model, signature))
+    ) -> OslPredictionOutcome {
+        let mut first_seen: Option<OslPredictionOutcome> = None;
+        let mut visit = |source: &'static str,
+                         stats: Option<&OslContextStats>,
+                         min_samples: usize|
+         -> Option<OslPredictionOutcome> {
+            let stats = stats?;
+            let sample_count = Some(stats.sample_count() as u32);
+            if let Some(osl) = stats.predict_p85(min_samples) {
+                return Some(OslPredictionOutcome {
+                    source,
+                    emitted_osl: Some(osl),
+                    confidence_passed: true,
+                    sample_count,
+                });
+            }
+            first_seen.get_or_insert(OslPredictionOutcome {
+                source,
+                emitted_osl: None,
+                confidence_passed: false,
+                sample_count,
+            });
+            None
+        };
+
+        if let Some(outcome) = root_uuid.and_then(|root_uuid| {
+            visit(
+                "run_local",
+                self.predict_run_local(root_uuid, model, signature),
+                RUN_MIN_SAMPLES,
+            )
+        }) {
+            return outcome;
+        }
+        if let Some(outcome) = visit(
+            "workflow",
+            self.workflow_stats(agent_id, model, signature),
+            PERSISTENT_MIN_SAMPLES,
+        ) {
+            return outcome;
+        }
+        if let Some(outcome) = visit(
+            "global",
+            self.global_stats(model, signature),
+            PERSISTENT_MIN_SAMPLES,
+        ) {
+            return outcome;
+        }
+        first_seen.unwrap_or(OslPredictionOutcome {
+            source: "none",
+            emitted_osl: None,
+            confidence_passed: false,
+            sample_count: None,
+        })
     }
 
     /// Remove temporary samples for a completed root scope.
     pub(crate) fn clear_run_contexts(&mut self, root_uuid: Uuid) {
         let prefix = format!("scope=run:{root_uuid}|");
         self.run_contexts.retain(|key, _| !key.starts_with(&prefix));
+    }
+}
+
+fn prune_oldest_contexts(contexts: &mut HashMap<String, OslContextStats>, max_contexts: usize) {
+    if max_contexts == 0 {
+        contexts.clear();
+        return;
+    }
+
+    while contexts.len() > max_contexts {
+        let Some(oldest_key) = contexts
+            .iter()
+            .min_by_key(|(_, stats)| {
+                stats
+                    .last_updated_at
+                    .map(|timestamp| timestamp.timestamp_millis())
+                    .unwrap_or(i64::MIN)
+            })
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        contexts.remove(&oldest_key);
     }
 }
 

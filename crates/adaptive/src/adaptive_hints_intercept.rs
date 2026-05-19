@@ -189,6 +189,31 @@ fn apply_priority_residual(
     )
 }
 
+fn merge_feedback(selection: &mut HintSelection, feedback: CallAdaptiveHints) {
+    if feedback.is_empty() {
+        return;
+    }
+    let target = selection
+        .feedback
+        .get_or_insert_with(CallAdaptiveHints::default);
+    if target.selected_priority_residual_arm.is_none() {
+        target.selected_priority_residual_arm = feedback.selected_priority_residual_arm;
+    }
+    if target.selected_priority_residual_key.is_none() {
+        target.selected_priority_residual_key = feedback.selected_priority_residual_key;
+    }
+    if target.emitted_priority.is_none() {
+        target.emitted_priority = feedback.emitted_priority;
+    }
+    if target.priority_cap.is_none() {
+        target.priority_cap = feedback.priority_cap;
+    }
+    target.selected_osl_source = feedback.selected_osl_source;
+    target.emitted_osl = feedback.emitted_osl;
+    target.osl_confidence_passed = feedback.osl_confidence_passed;
+    target.osl_sample_count = feedback.osl_sample_count;
+}
+
 fn priority_only_agent_hints(
     priority: u32,
     effective_agent_id: &str,
@@ -230,9 +255,22 @@ fn apply_empirical_osl_overlay(
 
     let predicted_osl = annotated.and_then(|request| {
         let signature = OslRequestSignature::from_request(request);
-        empirical_state
-            .predict(root_uuid, effective_agent_id, model_name, signature)
-            .map(|prediction| cap_osl_to_request_limit(prediction, request))
+        let mut outcome =
+            empirical_state.predict(root_uuid, effective_agent_id, model_name, signature);
+        if let Some(prediction) = outcome.emitted_osl {
+            outcome.emitted_osl = Some(cap_osl_to_request_limit(prediction, request));
+        }
+        merge_feedback(
+            &mut selection,
+            CallAdaptiveHints {
+                selected_osl_source: Some(outcome.source.to_string()),
+                emitted_osl: outcome.emitted_osl,
+                osl_confidence_passed: Some(outcome.confidence_passed),
+                osl_sample_count: outcome.sample_count,
+                ..CallAdaptiveHints::default()
+            },
+        );
+        outcome.emitted_osl
     });
 
     match (&mut selection.hints, predicted_osl) {
@@ -442,11 +480,15 @@ impl AdaptiveHintsIntercept {
 
                 if let Some(hints) = final_hints {
                     inject_agent_hints(&mut request, &hints);
-                    if manual_ls.is_none()
-                        && let Some(feedback) = selection.feedback.as_ref()
-                        && let Some(annotated) = annotated.as_mut()
-                    {
+                }
+
+                if let Some(feedback) = selection.feedback.as_ref()
+                    && let Some(annotated) = annotated.as_mut()
+                {
+                    if manual_ls.is_none() {
                         write_call_adaptive_hints(annotated, feedback);
+                    } else {
+                        write_call_adaptive_hints(annotated, &feedback.only_osl_feedback());
                     }
                 }
 

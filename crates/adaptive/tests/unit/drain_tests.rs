@@ -972,7 +972,10 @@ fn test_run_local_osl_hot_cache_update_and_clear() {
         .as_ref()
         .unwrap()
         .predict(Some(root_uuid), "agent-1", "model-a", signature);
-    assert_eq!(prediction, Some(30));
+    assert_eq!(prediction.source, "run_local");
+    assert_eq!(prediction.emitted_osl, Some(30));
+    assert!(prediction.confidence_passed);
+    assert_eq!(prediction.sample_count, Some(3));
 
     clear_run_local_osl(&hot_cache, root_uuid);
     assert!(

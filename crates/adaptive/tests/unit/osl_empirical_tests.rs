@@ -18,8 +18,9 @@ use crate::types::cache::HotCache;
 use crate::types::records::{CallKind, CallRecord, RunRecord};
 
 use super::{
-    OSL_MAX_SPREAD_MULTIPLIER, OslContextKey, OslContextScope, OslContextStats,
-    OslEmpiricalLearner, OslEmpiricalState, OslMessageRole, OslRequestSignature,
+    MAX_PERSISTENT_CONTEXTS, MAX_RUN_CONTEXTS, OSL_MAX_SPREAD_MULTIPLIER, OslContextKey,
+    OslContextScope, OslContextStats, OslEmpiricalLearner, OslEmpiricalState, OslMessageRole,
+    OslRequestSignature,
 };
 
 fn request(messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> AnnotatedLlmRequest {
@@ -318,21 +319,111 @@ fn empirical_state_prefers_run_local_prediction_then_persistent_prediction() {
         assert!(state.observe_run_call(root_uuid, &call));
     }
 
-    assert_eq!(
-        state.predict(Some(root_uuid), "agent-a", "model-a", signature),
-        Some(30)
-    );
-    assert_eq!(
-        state.predict(None, "agent-a", "model-a", signature),
-        Some(900)
-    );
+    let run_outcome = state.predict(Some(root_uuid), "agent-a", "model-a", signature);
+    assert_eq!(run_outcome.source, "run_local");
+    assert_eq!(run_outcome.emitted_osl, Some(30));
+    assert!(run_outcome.confidence_passed);
+    assert_eq!(run_outcome.sample_count, Some(3));
+
+    let persistent_outcome = state.predict(None, "agent-a", "model-a", signature);
+    assert_eq!(persistent_outcome.source, "workflow");
+    assert_eq!(persistent_outcome.emitted_osl, Some(900));
+    assert!(persistent_outcome.confidence_passed);
 
     state.clear_run_contexts(root_uuid);
     assert!(state.run_contexts.is_empty());
     assert_eq!(
-        state.predict(Some(root_uuid), "agent-a", "model-a", signature),
+        state
+            .predict(Some(root_uuid), "agent-a", "model-a", signature)
+            .emitted_osl,
         Some(900)
     );
+}
+
+#[test]
+fn empirical_state_reports_unconfident_and_missing_contexts() {
+    let req = request(
+        vec![Message::User {
+            content: MessageContent::Text("question".to_string()),
+            name: None,
+        }],
+        None,
+    );
+    let signature = OslRequestSignature::from_request(&req);
+    let mut state = OslEmpiricalState::new("agent-a");
+
+    let missing = state.predict(None, "agent-a", "model-a", signature);
+    assert_eq!(missing.source, "none");
+    assert_eq!(missing.emitted_osl, None);
+    assert!(!missing.confidence_passed);
+    assert_eq!(missing.sample_count, None);
+
+    state.observe_run_call(Uuid::from_u128(12), &llm_call(Some(100), Some(req)));
+    let unconfident = state.predict(Some(Uuid::from_u128(12)), "agent-a", "model-a", signature);
+    assert_eq!(unconfident.source, "run_local");
+    assert_eq!(unconfident.emitted_osl, None);
+    assert!(!unconfident.confidence_passed);
+    assert_eq!(unconfident.sample_count, Some(1));
+}
+
+#[test]
+fn empirical_state_bounds_persistent_and_run_context_counts() {
+    let mut state = OslEmpiricalState::new("agent-a");
+    let old_time = Utc.timestamp_millis_opt(1000).single().unwrap();
+    let new_time = Utc.timestamp_millis_opt(2000).single().unwrap();
+    for index in 0..=MAX_PERSISTENT_CONTEXTS {
+        state.contexts.insert(
+            format!("persistent-{index}"),
+            OslContextStats {
+                samples: VecDeque::from([index as u32]),
+                last_updated_at: Some(old_time),
+            },
+        );
+    }
+    state.contexts.insert(
+        "newest".to_string(),
+        OslContextStats {
+            samples: VecDeque::from([999]),
+            last_updated_at: Some(new_time),
+        },
+    );
+
+    let req = request(
+        vec![Message::User {
+            content: MessageContent::Text("question".to_string()),
+            name: None,
+        }],
+        None,
+    );
+    let signature = OslRequestSignature::from_request(&req);
+    state.observe_context(
+        OslContextKey {
+            scope: OslContextScope::Workflow {
+                agent_id: "agent-a".to_string(),
+            },
+            model: "model-a".to_string(),
+            signature,
+        },
+        42,
+        new_time,
+    );
+    assert!(state.contexts.len() <= MAX_PERSISTENT_CONTEXTS);
+    assert!(state.contexts.contains_key("newest"));
+
+    let call = llm_call(Some(42), Some(req));
+    assert!(state.observe_run_call(Uuid::from_u128(1), &call));
+
+    for index in 0..=MAX_RUN_CONTEXTS {
+        state.run_contexts.insert(
+            format!("run-{index}"),
+            OslContextStats {
+                samples: VecDeque::from([index as u32]),
+                last_updated_at: Some(old_time),
+            },
+        );
+    }
+    assert!(state.observe_run_call(Uuid::from_u128(2), &call));
+    assert!(state.run_contexts.len() <= MAX_RUN_CONTEXTS);
 }
 
 #[test]

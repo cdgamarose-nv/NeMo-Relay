@@ -454,7 +454,7 @@ fn test_adaptive_hints_intercept_empirical_osl_overrides_default_and_applies_cap
     let req_fn =
         AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
 
-    let (request, _) = req_fn(
+    let (request, returned_annotated) = req_fn(
         "model",
         LlmRequest {
             headers: serde_json::Map::new(),
@@ -469,6 +469,19 @@ fn test_adaptive_hints_intercept_empirical_osl_overrides_default_and_applies_cap
     assert_eq!(body_hints["iat"], serde_json::json!(12));
     assert_eq!(body_hints["priority"], serde_json::json!(3));
     assert_eq!(body_hints["prefix_id"], serde_json::json!("defaults"));
+    let returned_annotated = returned_annotated.unwrap();
+    let adaptive_hints =
+        &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
+    assert_eq!(
+        adaptive_hints["selected_osl_source"],
+        serde_json::json!("workflow")
+    );
+    assert_eq!(adaptive_hints["emitted_osl"], serde_json::json!(85));
+    assert_eq!(
+        adaptive_hints["osl_confidence_passed"],
+        serde_json::json!(true)
+    );
+    assert_eq!(adaptive_hints["osl_sample_count"], serde_json::json!(10));
 
     reset_root_metadata();
 }
@@ -506,7 +519,7 @@ fn test_adaptive_hints_intercept_empirical_osl_suppresses_default_when_unconfide
     let req_fn =
         AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
 
-    let (request, _) = req_fn(
+    let (request, returned_annotated) = req_fn(
         "model",
         LlmRequest {
             headers: serde_json::Map::new(),
@@ -520,6 +533,72 @@ fn test_adaptive_hints_intercept_empirical_osl_suppresses_default_when_unconfide
     assert!(body_hints.get("osl").is_none());
     assert_eq!(body_hints["iat"], serde_json::json!(12));
     assert_eq!(body_hints["priority"], serde_json::json!(3));
+    let returned_annotated = returned_annotated.unwrap();
+    let adaptive_hints =
+        &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
+    assert_eq!(
+        adaptive_hints["selected_osl_source"],
+        serde_json::json!("workflow")
+    );
+    assert!(adaptive_hints.get("emitted_osl").is_none());
+    assert_eq!(
+        adaptive_hints["osl_confidence_passed"],
+        serde_json::json!(false)
+    );
+    assert_eq!(adaptive_hints["osl_sample_count"], serde_json::json!(3));
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_records_omitted_empirical_osl_without_emitting_hints() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let annotated = annotated_with_messages(vec![Message::User {
+        content: MessageContent::Text("hello".into()),
+        name: None,
+    }]);
+    let osl_empirical = empirical_state_with_samples("fallback-agent", &annotated, [10, 20, 30]);
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: None,
+        priority_residual: None,
+        osl_empirical: Some(osl_empirical),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+
+    let (request, returned_annotated) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        Some(annotated),
+    )
+    .unwrap();
+
+    assert!(request.content.get("nvext").is_none());
+    let returned_annotated = returned_annotated.unwrap();
+    let adaptive_hints =
+        &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
+    assert_eq!(
+        adaptive_hints["selected_osl_source"],
+        serde_json::json!("workflow")
+    );
+    assert_eq!(
+        adaptive_hints["osl_confidence_passed"],
+        serde_json::json!(false)
+    );
+    assert_eq!(adaptive_hints["osl_sample_count"], serde_json::json!(3));
+    assert!(adaptive_hints.get("emitted_osl").is_none());
 
     reset_root_metadata();
 }
@@ -553,7 +632,7 @@ fn test_adaptive_hints_intercept_empirical_osl_can_emit_without_other_hints() {
     let req_fn =
         AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
 
-    let (request, _) = req_fn(
+    let (request, _returned_annotated) = req_fn(
         "model",
         LlmRequest {
             headers: serde_json::Map::new(),
@@ -601,7 +680,7 @@ fn test_adaptive_hints_intercept_empirical_osl_prefers_run_local_samples() {
     let req_fn =
         AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
 
-    let (request, _) = req_fn(
+    let (request, returned_annotated) = req_fn(
         "model",
         LlmRequest {
             headers: serde_json::Map::new(),
@@ -615,6 +694,14 @@ fn test_adaptive_hints_intercept_empirical_osl_prefers_run_local_samples() {
         request.content["nvext"]["agent_hints"]["osl"],
         serde_json::json!(30)
     );
+    let returned_annotated = returned_annotated.unwrap();
+    let adaptive_hints =
+        &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
+    assert_eq!(
+        adaptive_hints["selected_osl_source"],
+        serde_json::json!("run_local")
+    );
+    assert_eq!(adaptive_hints["emitted_osl"], serde_json::json!(30));
 
     reset_root_metadata();
 }
