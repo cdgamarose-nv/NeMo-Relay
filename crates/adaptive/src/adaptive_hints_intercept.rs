@@ -25,6 +25,7 @@ use crate::dag::{
     project_priority_prior,
 };
 use crate::intercepts::AGENT_HINTS_HEADER_KEY;
+use crate::osl_empirical::{OslEmpiricalState, OslRequestSignature, cap_osl_to_request_limit};
 use crate::priority_residual::PriorityResidualState;
 use crate::trie::builder::SensitivityConfig;
 use crate::trie::lookup::PredictionTrieLookup;
@@ -202,6 +203,48 @@ fn priority_only_agent_hints(
     }
 }
 
+fn osl_only_agent_hints(osl: u32, effective_agent_id: &str, scope_depth: usize) -> AgentHints {
+    AgentHints {
+        osl: Some(osl),
+        iat: 0,
+        priority: 0,
+        latency_sensitivity: 0.0,
+        prefix_id: format!("{effective_agent_id}-d{scope_depth}"),
+        total_requests: 0,
+    }
+}
+
+fn apply_empirical_osl_overlay(
+    mut selection: HintSelection,
+    empirical_state: Option<&OslEmpiricalState>,
+    annotated: Option<&AnnotatedLlmRequest>,
+    model_name: &str,
+    effective_agent_id: &str,
+    scope_depth: usize,
+) -> HintSelection {
+    let Some(empirical_state) = empirical_state else {
+        return selection;
+    };
+
+    let predicted_osl = annotated.and_then(|request| {
+        let signature = OslRequestSignature::from_request(request);
+        empirical_state
+            .predict_persistent(effective_agent_id, model_name, signature)
+            .map(|prediction| cap_osl_to_request_limit(prediction, request))
+    });
+
+    match (&mut selection.hints, predicted_osl) {
+        (Some(hints), Some(osl)) => hints.osl = Some(osl),
+        (Some(hints), None) => hints.osl = None,
+        (None, Some(osl)) => {
+            selection.hints = Some(osl_only_agent_hints(osl, effective_agent_id, scope_depth));
+        }
+        (None, None) => {}
+    }
+
+    selection
+}
+
 fn priority_cap_for_workflow_class(workflow_class: Option<WorkflowClass>) -> u32 {
     match workflow_class {
         Some(WorkflowClass::Background) => 1,
@@ -335,7 +378,7 @@ impl AdaptiveHintsIntercept {
         let model_name = annotated
             .and_then(|request| request.model.as_deref())
             .unwrap_or(llm_name);
-        apply_dag_priority_prior(
+        let selection = apply_dag_priority_prior(
             trie_hints,
             cache_guard.dag_cpm.as_ref(),
             cache_guard.priority_residual.as_ref(),
@@ -345,6 +388,14 @@ impl AdaptiveHintsIntercept {
             scope_depth,
             priority_cap,
             fallback_priority,
+        );
+        apply_empirical_osl_overlay(
+            selection,
+            cache_guard.osl_empirical.as_ref(),
+            annotated,
+            model_name,
+            effective_agent_id,
+            scope_depth,
         )
     }
 

@@ -319,6 +319,51 @@ impl OslEmpiricalState {
             .or_default()
             .observe(output_tokens, observed_at);
     }
+
+    /// Predict persistent empirical OSL from workflow history, then global history.
+    pub(crate) fn predict_persistent(
+        &self,
+        agent_id: &str,
+        model: &str,
+        signature: OslRequestSignature,
+    ) -> Option<u32> {
+        let workflow_key = OslContextKey {
+            scope: OslContextScope::Workflow {
+                agent_id: agent_id.to_string(),
+            },
+            model: model.to_string(),
+            signature,
+        }
+        .storage_key();
+        self.contexts
+            .get(&workflow_key)
+            .and_then(|stats| stats.predict_p85(PERSISTENT_MIN_SAMPLES))
+            .or_else(|| {
+                let global_key = OslContextKey {
+                    scope: OslContextScope::Global,
+                    model: model.to_string(),
+                    signature,
+                }
+                .storage_key();
+                self.contexts
+                    .get(&global_key)
+                    .and_then(|stats| stats.predict_p85(PERSISTENT_MIN_SAMPLES))
+            })
+    }
+}
+
+/// Apply an explicit request output-token cap to an empirical OSL prediction.
+pub(crate) fn cap_osl_to_request_limit(predicted_osl: u32, request: &AnnotatedLlmRequest) -> u32 {
+    let Some(limit) = request
+        .params
+        .as_ref()
+        .and_then(|params| params.max_tokens)
+        .or(request.max_output_tokens)
+    else {
+        return predicted_osl;
+    };
+    let capped = u64::from(predicted_osl).min(limit);
+    u32::try_from(capped).unwrap_or(u32::MAX)
 }
 
 /// Learner that stores empirical output-token samples from completed runs.
