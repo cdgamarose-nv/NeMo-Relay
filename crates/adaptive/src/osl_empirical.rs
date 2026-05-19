@@ -320,8 +320,60 @@ impl OslEmpiricalState {
             .observe(output_tokens, observed_at);
     }
 
+    fn observe_run_context(
+        &mut self,
+        root_uuid: Uuid,
+        model: String,
+        signature: OslRequestSignature,
+        output_tokens: u32,
+        observed_at: DateTime<Utc>,
+    ) {
+        let key = OslContextKey {
+            scope: OslContextScope::Run { root_uuid },
+            model,
+            signature,
+        }
+        .storage_key();
+        self.run_contexts
+            .entry(key)
+            .or_default()
+            .observe(output_tokens, observed_at);
+    }
+
+    /// Observe one completed LLM call into temporary run-local OSL history.
+    pub(crate) fn observe_run_call(&mut self, root_uuid: Uuid, call: &CallRecord) -> bool {
+        let Some(sample) = valid_call_sample(call, None) else {
+            return false;
+        };
+        self.observe_run_context(
+            root_uuid,
+            sample.model,
+            sample.signature,
+            sample.output_tokens,
+            sample.observed_at,
+        );
+        true
+    }
+
+    fn predict_run_local(
+        &self,
+        root_uuid: Uuid,
+        model: &str,
+        signature: OslRequestSignature,
+    ) -> Option<u32> {
+        let key = OslContextKey {
+            scope: OslContextScope::Run { root_uuid },
+            model: model.to_string(),
+            signature,
+        }
+        .storage_key();
+        self.run_contexts
+            .get(&key)
+            .and_then(|stats| stats.predict_p85(RUN_MIN_SAMPLES))
+    }
+
     /// Predict persistent empirical OSL from workflow history, then global history.
-    pub(crate) fn predict_persistent(
+    fn predict_persistent(
         &self,
         agent_id: &str,
         model: &str,
@@ -349,6 +401,25 @@ impl OslEmpiricalState {
                     .get(&global_key)
                     .and_then(|stats| stats.predict_p85(PERSISTENT_MIN_SAMPLES))
             })
+    }
+
+    /// Predict empirical OSL from active run history, then persistent history.
+    pub(crate) fn predict(
+        &self,
+        root_uuid: Option<Uuid>,
+        agent_id: &str,
+        model: &str,
+        signature: OslRequestSignature,
+    ) -> Option<u32> {
+        root_uuid
+            .and_then(|root_uuid| self.predict_run_local(root_uuid, model, signature))
+            .or_else(|| self.predict_persistent(agent_id, model, signature))
+    }
+
+    /// Remove temporary samples for a completed root scope.
+    pub(crate) fn clear_run_contexts(&mut self, root_uuid: Uuid) {
+        let prefix = format!("scope=run:{root_uuid}|");
+        self.run_contexts.retain(|key, _| !key.starts_with(&prefix));
     }
 }
 
@@ -421,6 +492,9 @@ impl Learner for OslEmpiricalLearner {
             let mut guard = hot_cache.write().map_err(|error| {
                 AdaptiveError::Internal(format!("hot cache lock poisoned: {error}"))
             })?;
+            if let Some(existing) = guard.osl_empirical.as_ref() {
+                state.run_contexts = existing.run_contexts.clone();
+            }
             guard.osl_empirical = Some(state);
 
             Ok(())
@@ -435,11 +509,42 @@ struct CompletedCallSample {
     global_key: OslContextKey,
 }
 
+struct ValidCallSample {
+    output_tokens: u32,
+    observed_at: DateTime<Utc>,
+    model: String,
+    signature: OslRequestSignature,
+}
+
 fn completed_call_sample(
     agent_id: &str,
     call: &CallRecord,
     run_ended_at: Option<DateTime<Utc>>,
 ) -> Option<CompletedCallSample> {
+    let sample = valid_call_sample(call, run_ended_at)?;
+
+    Some(CompletedCallSample {
+        output_tokens: sample.output_tokens,
+        observed_at: sample.observed_at,
+        workflow_key: OslContextKey {
+            scope: OslContextScope::Workflow {
+                agent_id: agent_id.to_string(),
+            },
+            model: sample.model.clone(),
+            signature: sample.signature,
+        },
+        global_key: OslContextKey {
+            scope: OslContextScope::Global,
+            model: sample.model,
+            signature: sample.signature,
+        },
+    })
+}
+
+fn valid_call_sample(
+    call: &CallRecord,
+    fallback_ended_at: Option<DateTime<Utc>>,
+) -> Option<ValidCallSample> {
     if call.kind != CallKind::Llm {
         return None;
     }
@@ -455,23 +560,13 @@ fn completed_call_sample(
         .or(call.model_name.as_deref())?
         .to_string();
     let signature = OslRequestSignature::from_request(request);
-    let observed_at = call.ended_at.or(run_ended_at).unwrap_or_else(Utc::now);
+    let observed_at = call.ended_at.or(fallback_ended_at).unwrap_or_else(Utc::now);
 
-    Some(CompletedCallSample {
+    Some(ValidCallSample {
         output_tokens,
         observed_at,
-        workflow_key: OslContextKey {
-            scope: OslContextScope::Workflow {
-                agent_id: agent_id.to_string(),
-            },
-            model: model.clone(),
-            signature,
-        },
-        global_key: OslContextKey {
-            scope: OslContextScope::Global,
-            model,
-            signature,
-        },
+        model,
+        signature,
     })
 }
 

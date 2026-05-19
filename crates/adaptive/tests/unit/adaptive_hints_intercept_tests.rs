@@ -21,6 +21,7 @@ use nemo_flow::api::runtime::current_scope_stack;
 use nemo_flow::api::scope::ScopeType;
 use nemo_flow::api::scope::{pop_scope, push_scope};
 use nemo_flow::codec::request::{AnnotatedLlmRequest, GenerationParams, Message, MessageContent};
+use uuid::Uuid;
 
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -100,6 +101,29 @@ fn empirical_state_with_samples(
     }
     .storage_key();
     state.contexts.insert(
+        key,
+        OslContextStats {
+            samples: VecDeque::from_iter(samples),
+            last_updated_at: Some(Utc::now()),
+        },
+    );
+    state
+}
+
+fn empirical_state_with_run_samples(
+    agent_id: &str,
+    root_uuid: Uuid,
+    request: &AnnotatedLlmRequest,
+    samples: impl IntoIterator<Item = u32>,
+) -> OslEmpiricalState {
+    let mut state = OslEmpiricalState::new(agent_id);
+    let key = OslContextKey {
+        scope: OslContextScope::Run { root_uuid },
+        model: request.model.as_ref().unwrap().clone(),
+        signature: OslRequestSignature::from_request(request),
+    }
+    .storage_key();
+    state.run_contexts.insert(
         key,
         OslContextStats {
             samples: VecDeque::from_iter(samples),
@@ -545,6 +569,51 @@ fn test_adaptive_hints_intercept_empirical_osl_can_emit_without_other_hints() {
     assert_eq!(
         body_hints["prefix_id"],
         serde_json::json!("fallback-agent-d0")
+    );
+
+    reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_empirical_osl_prefers_run_local_samples() {
+    let _guard = test_mutex().lock().unwrap();
+    reset_root_metadata();
+
+    let annotated = annotated_with_messages(vec![Message::User {
+        content: MessageContent::Text("hello".into()),
+        name: None,
+    }]);
+    let root_uuid = current_scope_stack().read().unwrap().root_uuid();
+    let osl_empirical =
+        empirical_state_with_run_samples("fallback-agent", root_uuid, &annotated, [10, 20, 30]);
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: None,
+        priority_residual: None,
+        osl_empirical: Some(osl_empirical),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+
+    let (request, _) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        Some(annotated),
+    )
+    .unwrap();
+
+    assert_eq!(
+        request.content["nvext"]["agent_hints"]["osl"],
+        serde_json::json!(30)
     );
 
     reset_root_metadata();

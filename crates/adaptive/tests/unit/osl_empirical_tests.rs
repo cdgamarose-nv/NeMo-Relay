@@ -286,6 +286,56 @@ fn predict_p85_requires_confidence() {
 }
 
 #[test]
+fn empirical_state_prefers_run_local_prediction_then_persistent_prediction() {
+    let root_uuid = Uuid::from_u128(7);
+    let req = request(
+        vec![Message::User {
+            content: MessageContent::Text("question".to_string()),
+            name: None,
+        }],
+        Some(vec![tool_definition()]),
+    );
+    let signature = OslRequestSignature::from_request(&req);
+    let mut state = OslEmpiricalState::new("agent-a");
+    let workflow_key = OslContextKey {
+        scope: OslContextScope::Workflow {
+            agent_id: "agent-a".to_string(),
+        },
+        model: "model-a".to_string(),
+        signature,
+    }
+    .storage_key();
+    state.contexts.insert(
+        workflow_key,
+        OslContextStats {
+            samples: VecDeque::from([100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]),
+            last_updated_at: None,
+        },
+    );
+
+    for output_tokens in [10, 20, 30] {
+        let call = llm_call(Some(output_tokens), Some(req.clone()));
+        assert!(state.observe_run_call(root_uuid, &call));
+    }
+
+    assert_eq!(
+        state.predict(Some(root_uuid), "agent-a", "model-a", signature),
+        Some(30)
+    );
+    assert_eq!(
+        state.predict(None, "agent-a", "model-a", signature),
+        Some(900)
+    );
+
+    state.clear_run_contexts(root_uuid);
+    assert!(state.run_contexts.is_empty());
+    assert_eq!(
+        state.predict(Some(root_uuid), "agent-a", "model-a", signature),
+        Some(900)
+    );
+}
+
+#[test]
 fn observe_records_time_and_evicts_oldest_samples() {
     let mut stats = OslContextStats::default();
     let first = Utc.timestamp_millis_opt(1000).single().unwrap();

@@ -112,8 +112,17 @@ fn test_helpers_return_defaults_when_scope_stack_lock_is_poisoned() {
     assert_eq!(read_manual_latency_sensitivity(), None);
     assert_eq!(read_workflow_class(), None);
     assert_eq!(resolve_agent_id(), None);
+    assert_eq!(resolve_root_scope_uuid(), None);
 
     set_thread_scope_stack(create_scope_stack());
+}
+
+#[test]
+fn test_resolve_root_scope_uuid_reads_current_stack_root() {
+    let stack_handle = current_scope_stack();
+    let root_uuid = stack_handle.read().unwrap().root_uuid();
+
+    assert_eq!(resolve_root_scope_uuid(), Some(root_uuid));
 }
 
 #[test]

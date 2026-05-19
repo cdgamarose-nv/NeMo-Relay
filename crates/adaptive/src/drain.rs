@@ -17,12 +17,25 @@ use crate::learner::traits::Learner;
 use crate::storage::traits::StorageBackendDyn;
 use crate::subscriber::{event_to_call_record, is_run_boundary};
 use crate::types::cache::HotCache;
-use crate::types::records::{BackendTiming, CallRecord, RunRecord};
+use crate::types::records::{BackendTiming, CallKind, CallRecord, RunRecord};
 
 #[derive(Debug, Clone, Copy)]
 struct CallLocator {
     root_uuid: Uuid,
     call_index: usize,
+}
+
+#[derive(Debug, Default)]
+struct RunEventOutcome {
+    completed_run: Option<RunRecord>,
+    completed_llm_call: Option<CompletedRunCall>,
+    finished_root_uuid: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedRunCall {
+    root_uuid: Uuid,
+    call: CallRecord,
 }
 
 pub(crate) struct RunAccumulator {
@@ -47,47 +60,57 @@ impl RunAccumulator {
         self.open_runs.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn process_event(
         &mut self,
         event: &Event,
         scope_path: &[String],
     ) -> Option<RunRecord> {
+        self.process_event_outcome(event, scope_path).completed_run
+    }
+
+    fn process_event_outcome(&mut self, event: &Event, scope_path: &[String]) -> RunEventOutcome {
         if let Some(boundary_result) = self.process_run_boundary(event) {
             return boundary_result;
         }
 
         match (event.scope_category(), event.scope_type()) {
             (Some(ScopeCategory::Start), Some(ScopeType::Tool | ScopeType::Llm)) => {
-                self.track_call_start(event, scope_path)?;
-                None
+                self.track_call_start(event, scope_path);
+                RunEventOutcome::default()
             }
-            (Some(ScopeCategory::End), Some(ScopeType::Tool | ScopeType::Llm)) => {
-                self.track_call_end(event)?;
-                None
-            }
+            (Some(ScopeCategory::End), Some(ScopeType::Tool | ScopeType::Llm)) => RunEventOutcome {
+                completed_llm_call: self.track_call_end(event),
+                ..RunEventOutcome::default()
+            },
             (Some(ScopeCategory::Start), Some(scope_type)) => {
-                self.track_nested_scope_start(event, scope_type)?;
-                None
+                self.track_nested_scope_start(event, scope_type);
+                RunEventOutcome::default()
             }
             (Some(ScopeCategory::End), Some(scope_type)) => {
                 self.track_nested_scope_end(event, scope_type);
-                None
+                RunEventOutcome::default()
             }
-            _ => None,
+            _ => RunEventOutcome::default(),
         }
     }
 
-    fn process_run_boundary(&mut self, event: &Event) -> Option<Option<RunRecord>> {
+    fn process_run_boundary(&mut self, event: &Event) -> Option<RunEventOutcome> {
         if !is_run_boundary(event) {
             return None;
         }
 
         if event.scope_category() == Some(ScopeCategory::Start) {
             self.start_run(event);
-            return Some(None);
+            return Some(RunEventOutcome::default());
         }
 
-        Some(self.finish_run(event))
+        let (root_uuid, completed_run) = self.finish_run(event)?;
+        Some(RunEventOutcome {
+            completed_run: Some(completed_run),
+            finished_root_uuid: Some(root_uuid),
+            ..RunEventOutcome::default()
+        })
     }
 
     fn start_run(&mut self, event: &Event) {
@@ -103,7 +126,7 @@ impl RunAccumulator {
         self.open_runs.insert(root_uuid, run);
     }
 
-    fn finish_run(&mut self, event: &Event) -> Option<RunRecord> {
+    fn finish_run(&mut self, event: &Event) -> Option<(Uuid, RunRecord)> {
         let root_uuid = self
             .event_roots
             .remove(&event.uuid())
@@ -112,7 +135,7 @@ impl RunAccumulator {
             .retain(|_, locator| locator.root_uuid != root_uuid);
         let mut run = self.open_runs.remove(&root_uuid)?;
         run.ended_at = Some(*event.timestamp());
-        Some(run)
+        Some((root_uuid, run))
     }
 
     fn track_nested_scope_start(&mut self, event: &Event, scope_type: ScopeType) -> Option<()> {
@@ -150,21 +173,28 @@ impl RunAccumulator {
         Some(())
     }
 
-    fn track_call_end(&mut self, event: &Event) -> Option<()> {
+    fn track_call_end(&mut self, event: &Event) -> Option<CompletedRunCall> {
         let root_uuid = self.infer_root_uuid(event)?;
+        let mut completed_call = None;
         if let Some(locator) = self.open_call_index.remove(&event.uuid())
             && let Some(call) = self.call_mut(locator)
         {
             call.ended_at = Some(*event.timestamp());
             apply_llm_end_metadata(call, event);
+            if call.kind == CallKind::Llm {
+                completed_call = Some(call.clone());
+            }
         } else if let Some(run) = self.open_runs.get_mut(&root_uuid)
             && let Some(call) = find_open_call(run, event.name())
         {
             call.ended_at = Some(*event.timestamp());
             apply_llm_end_metadata(call, event);
+            if call.kind == CallKind::Llm {
+                completed_call = Some(call.clone());
+            }
         }
         self.event_roots.remove(&event.uuid());
-        Some(())
+        completed_call.map(|call| CompletedRunCall { root_uuid, call })
     }
 
     fn call_mut(&mut self, locator: CallLocator) -> Option<&mut CallRecord> {
@@ -277,6 +307,26 @@ async fn refresh_hot_cache_plan(
     }
 }
 
+fn observe_run_local_osl(
+    hot_cache: &Arc<RwLock<HotCache>>,
+    root_uuid: Uuid,
+    completed_call: &CallRecord,
+) {
+    if let Ok(mut guard) = hot_cache.write()
+        && let Some(state) = guard.osl_empirical.as_mut()
+    {
+        state.observe_run_call(root_uuid, completed_call);
+    }
+}
+
+fn clear_run_local_osl(hot_cache: &Arc<RwLock<HotCache>>, root_uuid: Uuid) {
+    if let Ok(mut guard) = hot_cache.write()
+        && let Some(state) = guard.osl_empirical.as_mut()
+    {
+        state.clear_run_contexts(root_uuid);
+    }
+}
+
 /// Background task that drains events from the telemetry channel, accumulates
 /// them into [`RunRecord`]s, stores completed runs, and refreshes the hot cache.
 ///
@@ -315,14 +365,26 @@ pub(crate) async fn drain_task_with_counter(
     let mut accumulator = RunAccumulator::new(agent_id.clone());
 
     while let Some((event, scope_path)) = rx.recv().await {
-        if let Some(completed_run) = accumulator.process_event(&event, &scope_path) {
+        let outcome = accumulator.process_event_outcome(&event, &scope_path);
+
+        if let Some(completed_call) = outcome.completed_llm_call.as_ref() {
+            observe_run_local_osl(&hot_cache, completed_call.root_uuid, &completed_call.call);
+        }
+
+        if let Some(completed_run) = outcome.completed_run {
             if !store_run(&backend, &completed_run).await {
+                if let Some(root_uuid) = outcome.finished_root_uuid {
+                    clear_run_local_osl(&hot_cache, root_uuid);
+                }
                 pending_events.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
 
             run_learners(&learners, &completed_run, &backend, &hot_cache).await;
             refresh_hot_cache_plan(&backend, &hot_cache, &agent_id).await;
+            if let Some(root_uuid) = outcome.finished_root_uuid {
+                clear_run_local_osl(&hot_cache, root_uuid);
+            }
         }
         pending_events.fetch_sub(1, Ordering::SeqCst);
     }

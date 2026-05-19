@@ -10,6 +10,7 @@
 //! - [`read_manual_latency_sensitivity`]: walks all scopes for manual `latency_sensitive` annotations
 //! - [`read_workflow_class`]: reads workflow scheduling class metadata for priority caps
 //! - [`resolve_agent_id`]: returns the first Agent scope name from the scope stack
+//! - [`resolve_root_scope_uuid`]: returns the current execution tree root UUID
 //!
 //! All functions are safe to call from sync contexts (intercepts are sync closures).
 //! They acquire a read lock on the scope stack, which is always fast.
@@ -226,6 +227,18 @@ pub fn resolve_agent_id() -> Option<String> {
         .skip(1) // skip implicit root
         .find(|s| matches!(s.scope_type, ScopeType::Agent))
         .map(|s| s.name.clone())
+}
+
+/// Resolves the root scope UUID for the current execution tree.
+///
+/// Returns `None` if the scope stack cannot be read.
+pub fn resolve_root_scope_uuid() -> Option<Uuid> {
+    let stack_handle = current_scope_stack();
+    let stack = match stack_handle.read() {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    Some(stack.root_uuid())
 }
 
 /// Resolves the session-local identity used by warm-first cohort coordination.

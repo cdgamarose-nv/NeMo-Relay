@@ -4,6 +4,7 @@
 //! Unit tests for drain in the NeMo Flow adaptive crate.
 
 use super::*;
+use crate::osl_empirical::{OslEmpiricalState, OslRequestSignature};
 use crate::storage::memory::InMemoryBackend;
 use crate::storage::traits::{StorageBackend, StorageBackendDyn};
 use crate::trie::accumulator::AccumulatorState;
@@ -16,6 +17,7 @@ use nemo_flow::api::event::{
     BaseEvent, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
 };
 use nemo_flow::api::scope::ScopeType;
+use nemo_flow::codec::request::{AnnotatedLlmRequest, Message, MessageContent};
 use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
@@ -837,6 +839,152 @@ fn make_llm_end_with_annotated(
                 .build(),
         ),
     ))
+}
+
+fn drain_test_request() -> AnnotatedLlmRequest {
+    AnnotatedLlmRequest {
+        messages: vec![Message::User {
+            content: MessageContent::Text("question".to_string()),
+            name: None,
+        }],
+        model: Some("model-a".to_string()),
+        params: None,
+        tools: None,
+        tool_choice: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::new(),
+    }
+}
+
+fn make_llm_start_with_annotated(
+    uuid: Uuid,
+    parent_uuid: Option<Uuid>,
+    name: &str,
+    annotated: AnnotatedLlmRequest,
+) -> Event {
+    Event::Scope(ScopeEvent::new(
+        BaseEvent::builder()
+            .parent_uuid_opt(parent_uuid)
+            .uuid(uuid)
+            .name(name)
+            .build(),
+        ScopeCategory::Start,
+        Vec::new(),
+        EventCategory::llm(),
+        Some(
+            nemo_flow::api::event::CategoryProfile::builder()
+                .annotated_request(Arc::new(annotated))
+                .build(),
+        ),
+    ))
+}
+
+#[test]
+fn test_accumulator_reports_completed_llm_call_for_run_local_osl() {
+    use nemo_flow::codec::response::{AnnotatedLlmResponse, Usage};
+
+    let mut acc = RunAccumulator::new("agent-1".to_string());
+    let agent_start = make_agent_start();
+    let root_uuid = agent_start.uuid();
+    acc.process_event(&agent_start, &[]);
+
+    let llm_uuid = Uuid::now_v7();
+    let llm_start =
+        make_llm_start_with_annotated(llm_uuid, Some(root_uuid), "model-a", drain_test_request());
+    acc.process_event(&llm_start, &[]);
+
+    let llm_end = make_llm_end_with_annotated(
+        llm_uuid,
+        Some(root_uuid),
+        "model-a",
+        AnnotatedLlmResponse {
+            id: None,
+            model: Some("model-a".to_string()),
+            message: None,
+            tool_calls: None,
+            finish_reason: None,
+            usage: Some(Usage {
+                prompt_tokens: Some(40),
+                completion_tokens: Some(80),
+                total_tokens: Some(120),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            }),
+            api_specific: None,
+            extra: serde_json::Map::new(),
+        },
+    );
+    let outcome = acc.process_event_outcome(&llm_end, &[]);
+    let completed = outcome
+        .completed_llm_call
+        .expect("LLM end should report a completed call");
+
+    assert_eq!(completed.root_uuid, root_uuid);
+    assert_eq!(completed.call.output_tokens, Some(80));
+    assert!(completed.call.annotated_request.is_some());
+}
+
+#[test]
+fn test_run_local_osl_hot_cache_update_and_clear() {
+    let root_uuid = Uuid::from_u128(9);
+    let request = drain_test_request();
+    let signature = OslRequestSignature::from_request(&request);
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: None,
+        priority_residual: None,
+        osl_empirical: Some(OslEmpiricalState::new("agent-1")),
+        acg_profiles: std::collections::HashMap::new(),
+        acg_profile_observation_counts: std::collections::HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+
+    for output_tokens in [10, 20, 30] {
+        let call = CallRecord {
+            kind: crate::types::records::CallKind::Llm,
+            output_tokens: Some(output_tokens),
+            model_name: Some("model-a".to_string()),
+            annotated_request: Some(Arc::new(request.clone())),
+            ..CallRecord::default()
+        };
+        observe_run_local_osl(&hot_cache, root_uuid, &call);
+    }
+
+    let prediction = hot_cache
+        .read()
+        .unwrap()
+        .osl_empirical
+        .as_ref()
+        .unwrap()
+        .predict(Some(root_uuid), "agent-1", "model-a", signature);
+    assert_eq!(prediction, Some(30));
+
+    clear_run_local_osl(&hot_cache, root_uuid);
+    assert!(
+        hot_cache
+            .read()
+            .unwrap()
+            .osl_empirical
+            .as_ref()
+            .unwrap()
+            .run_contexts
+            .is_empty()
+    );
 }
 
 #[test]
