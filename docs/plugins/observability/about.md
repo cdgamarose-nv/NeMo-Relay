@@ -57,8 +57,12 @@ Choose the exporter based on the downstream system:
 | Generic OTLP traces | [OpenTelemetry](opentelemetry.md) |
 | OpenInference-oriented agent and LLM spans | [OpenInference](openinference.md) |
 
-Start with local event inspection before production export. Add sanitize
+Start with in-process event inspection before exporting externally. Add sanitize
 guardrails before exporters receive sensitive payloads.
+
+For trace incidents involving missing traces, wrong scope attachment, export
+failures, duplicate events, or sensitive telemetry, use the
+[Trace Incident Runbook](../../troubleshooting/trace-incident-runbook.md).
 
 ## Correlating Trajectories And Traces
 
