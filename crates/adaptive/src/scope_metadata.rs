@@ -11,6 +11,7 @@ const GRAPH_SCOPE_KEY: &str = "nemo_flow.graph.scope";
 const GRAPH_NODE_KEY: &str = "nemo_flow.graph.node";
 const GRAPH_NODE_NAME_KEY: &str = "nemo_flow.graph.node_name";
 const GRAPH_TASK_ID_KEY: &str = "nemo_flow.graph.task_id";
+const GRAPH_DEPENDS_ON_TASK_IDS_KEY: &str = "nemo_flow.graph.depends_on_task_ids";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeGraphMetadata {
@@ -18,6 +19,7 @@ pub(crate) struct ScopeGraphMetadata {
     pub(crate) is_graph_node: bool,
     pub(crate) node_name: Option<String>,
     pub(crate) task_id: Option<String>,
+    pub(crate) depends_on_task_ids: Vec<String>,
 }
 
 pub(crate) fn run_boundary_override(event: &Event) -> Option<bool> {
@@ -39,6 +41,7 @@ pub(crate) fn scope_graph_metadata_from_value(
         node_name: metadata_str_value(metadata, GRAPH_NODE_NAME_KEY)
             .or_else(|| is_graph_node.then(|| scope_name.to_string())),
         task_id: metadata_str_value(metadata, GRAPH_TASK_ID_KEY),
+        depends_on_task_ids: metadata_str_array_value(metadata, GRAPH_DEPENDS_ON_TASK_IDS_KEY),
     }
 }
 
@@ -59,4 +62,16 @@ fn metadata_str_value(metadata: Option<&Value>, key: &str) -> Option<String> {
         .and_then(|object| object.get(key))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn metadata_str_array_value(metadata: Option<&Value>, key: &str) -> Vec<String> {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }

@@ -243,6 +243,9 @@ pub struct GraphCallContext {
     pub node_name: String,
     /// Graph task identifier for this node execution.
     pub task_id: String,
+    /// Graph task identifiers that this node execution depends on.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub depends_on_task_ids: Vec<String>,
 }
 
 /// Telemetry record for one observed agent run.

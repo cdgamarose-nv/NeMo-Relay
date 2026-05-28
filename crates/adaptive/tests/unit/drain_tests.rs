@@ -533,6 +533,7 @@ fn test_accumulator_records_graph_call_context() {
             "nemo_flow.run_boundary": false,
             "nemo_flow.graph.task_id": "task-1",
             "nemo_flow.graph.node_name": "researcher",
+            "nemo_flow.graph.depends_on_task_ids": ["task-0"],
         }),
     );
     acc.process_event(&node_start, &[]);
@@ -566,6 +567,7 @@ fn test_accumulator_records_graph_call_context() {
     assert_eq!(facts.graph_name.as_deref(), Some("research_graph"));
     assert_eq!(facts.node_name, "researcher");
     assert_eq!(facts.task_id, "task-1");
+    assert_eq!(facts.depends_on_task_ids, vec!["task-0"]);
 }
 
 #[test]

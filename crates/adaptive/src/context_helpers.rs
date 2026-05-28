@@ -113,11 +113,13 @@ pub(crate) fn extract_graph_call_context() -> Option<GraphCallContext> {
     let mut graph_name = None;
     let mut node_name = None;
     let mut task_id = None;
+    let mut depends_on_task_ids = Vec::new();
     for scope in stack.scopes().iter().rev() {
         let graph = scope_graph_metadata_from_value(&scope.name, scope.metadata.as_ref());
         if task_id.is_none() && graph.is_graph_node {
             task_id = graph.task_id;
             node_name = graph.node_name;
+            depends_on_task_ids = graph.depends_on_task_ids;
         }
         if graph_name.is_none() && graph.is_graph_scope {
             graph_name = Some(scope.name.clone());
@@ -131,6 +133,7 @@ pub(crate) fn extract_graph_call_context() -> Option<GraphCallContext> {
         graph_name,
         node_name: node_name?,
         task_id: task_id?,
+        depends_on_task_ids,
     })
 }
 

@@ -1,9 +1,9 @@
 diff --git a/libs/langgraph/langgraph/_nemo_flow.py b/libs/langgraph/langgraph/_nemo_flow.py
 new file mode 100644
-index 00000000..ad15faba
+index 000000000..224bf329e
 --- /dev/null
 +++ b/libs/langgraph/langgraph/_nemo_flow.py
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,538 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +# SPDX-License-Identifier: Apache-2.0
 +
@@ -93,6 +93,20 @@ index 00000000..ad15faba
 +_graph_scope_info: contextvars.ContextVar[_GraphScopeInfo | None] = (
 +    contextvars.ContextVar("_graph_scope_info", default=None)
 +)
++_graph_channel_writers: contextvars.ContextVar[dict[str, tuple[int, list[str]]]] = (
++    contextvars.ContextVar("_graph_channel_writers", default={})
++)
++
++_NULL_TASK_ID = "00000000-0000-0000-0000-000000000000"
++_SPECIAL_WRITE_CHANNELS = {
++    "__error__",
++    "__interrupt__",
++    "__no_writes__",
++    "__pregel_push",
++    "__pregel_tasks",
++    "__resume__",
++    "__return__",
++}
 +
 +
 +def _graph_scope_metadata(*, run_boundary: bool, subgraph: bool = False) -> dict[str, Any]:
@@ -190,6 +204,7 @@ index 00000000..ad15faba
 +            response_codec=response_codec,
 +        )
 +    )
++    _graph_channel_writers.set({})
 +    return handle
 +
 +
@@ -201,6 +216,7 @@ index 00000000..ad15faba
 +    nemo_flow.scope.pop(handle)
 +    _langgraph_nemo_flow_active.set(False)
 +    _graph_scope_info.set(None)
++    _graph_channel_writers.set({})
 +
 +
 +# ---------------------------------------------------------------------------
@@ -209,7 +225,10 @@ index 00000000..ad15faba
 +
 +
 +def push_node_scope(
-+    task_name: str, task_id: str
++    task_name: str,
++    task_id: str,
++    *,
++    depends_on_task_ids: list[str] | None = None,
 +) -> tuple[Any, Any | None, Any | None]:
 +    """Push a node-level NeMo Flow scope on an isolated per-branch scope stack.
 +
@@ -243,18 +262,56 @@ index 00000000..ad15faba
 +        metadata=graph_metadata,
 +    )
 +
++    node_metadata = {
++        "nemo_flow.graph.node": True,
++        "nemo_flow.run_boundary": False,
++        "nemo_flow.graph.task_id": task_id,
++        "nemo_flow.graph.node_name": task_name,
++    }
++    if depends_on_task_ids:
++        node_metadata["nemo_flow.graph.depends_on_task_ids"] = depends_on_task_ids
++
 +    # Push the node scope as a child of the branch graph scope
 +    node_handle = nemo_flow.scope.push(
 +        task_name,
 +        nemo_flow.ScopeType.Agent,
-+        metadata={
-+            "nemo_flow.graph.node": True,
-+            "nemo_flow.run_boundary": False,
-+            "nemo_flow.graph.task_id": task_id,
-+            "nemo_flow.graph.node_name": task_name,
-+        },
++        metadata=node_metadata,
 +    )
 +    return node_handle, graph_handle, saved_token
++
++
++def record_task_writes(step: int, task_id: str, writes: Any) -> None:
++    """Record graph channel producers for later dependency metadata."""
++    if task_id == _NULL_TASK_ID:
++        return
++    writers = dict(_graph_channel_writers.get({}))
++    changed = False
++    for channel, _ in writes:
++        if not isinstance(channel, str) or channel in _SPECIAL_WRITE_CHANNELS:
++            continue
++        previous_step, task_ids = writers.get(channel, (step, []))
++        if previous_step != step:
++            task_ids = []
++        if task_id not in task_ids:
++            task_ids.append(task_id)
++        writers[channel] = (step, task_ids)
++        changed = True
++    if changed:
++        _graph_channel_writers.set(writers)
++
++
++def dependency_task_ids_for_triggers(triggers: Any) -> list[str]:
++    """Return producer task ids for the channels that triggered a node."""
++    writers = _graph_channel_writers.get({})
++    depends_on_task_ids: list[str] = []
++    for trigger in triggers or ():
++        entry = writers.get(trigger)
++        if entry is None:
++            continue
++        for task_id in entry[1]:
++            if task_id not in depends_on_task_ids:
++                depends_on_task_ids.append(task_id)
++    return depends_on_task_ids
 +
 +
 +def pop_node_scope(node_handle: Any, graph_handle: Any | None, saved_token: Any | None = None) -> None:
@@ -485,14 +542,11 @@ index 00000000..ad15faba
 +        "Superstep End",
 +        data={"step": step, "task_count": task_count},
 +    )
-+
 diff --git a/libs/langgraph/langgraph/pregel/_loop.py b/libs/langgraph/langgraph/pregel/_loop.py
-index 4f9c55d2..cabe5d3d 100644
+index 4f9c55d2d..93e311ac7 100644
 --- a/libs/langgraph/langgraph/pregel/_loop.py
 +++ b/libs/langgraph/langgraph/pregel/_loop.py
-@@ -524,6 +524,11 @@ class PregelLoop:
-         if self.interrupt_before and should_interrupt(
-             self.checkpoint, self.interrupt_before, self.tasks.values()
+@@ -526,2 +526,7 @@ class PregelLoop:
          ):
 +            from langgraph import _nemo_flow
 +            _nemo_flow.emit_graph_interrupt(
@@ -500,30 +554,18 @@ index 4f9c55d2..cabe5d3d 100644
 +                interrupts=[],
 +            )
              self.status = "interrupt_before"
-             raise GraphInterrupt()
-
-@@ -535,6 +540,9 @@ class PregelLoop:
-             if task.writes:
-                 self.output_writes(task.id, task.writes, cached=True)
-
+@@ -537,2 +542,5 @@ class PregelLoop:
+ 
 +        from langgraph import _nemo_flow
 +        _nemo_flow.emit_superstep_start(step=self.step, task_count=len(self.tasks))
 +
          return True
-
-     def after_tick(self) -> None:
-@@ -548,6 +556,8 @@ class PregelLoop:
-             self.checkpointer_get_next_version,
-             self.trigger_to_nodes,
+@@ -550,2 +558,4 @@ class PregelLoop:
          )
 +        from langgraph import _nemo_flow
 +        _nemo_flow.emit_superstep_end(step=self.step, task_count=len(self.tasks))
          # produce values output
-         if not self.updated_channels.isdisjoint(
-             (self.output_keys,)
-@@ -567,6 +577,20 @@ class PregelLoop:
-         if self.interrupt_after and should_interrupt(
-             self.checkpoint, self.interrupt_after, self.tasks.values()
+@@ -569,2 +579,16 @@ class PregelLoop:
          ):
 +            from langgraph import _nemo_flow
 +            # Collect interrupt payloads from task writes (Pitfall 5)
@@ -540,21 +582,13 @@ index 4f9c55d2..cabe5d3d 100644
 +                interrupts=_interrupts,
 +            )
              self.status = "interrupt_after"
-             raise GraphInterrupt()
-         # unset resuming flag
-@@ -690,6 +714,9 @@ class PregelLoop:
-                             "Docs: https://docs.langchain.com/oss/python/langgraph/add-human-in-the-loop#resume-multiple-interrupts-with-one-invocation."
-                         )
-
+@@ -692,2 +716,5 @@ class PregelLoop:
+ 
 +                from langgraph import _nemo_flow
 +                _nemo_flow.emit_graph_resume(resume_values=resume)
 +
              writes: defaultdict[str, list[tuple[str, Any]]] = defaultdict(list)
-             # group writes by task ID
-             for tid, c, v in map_command(cmd=cast(Command, self.input)):
-@@ -823,6 +850,13 @@ class PregelLoop:
-         # bail if no checkpointer
-
+@@ -825,2 +852,9 @@ class PregelLoop:
          if do_checkpoint and self._checkpointer_put_after_previous is not None:
 +            from langgraph import _nemo_flow
 +            _nemo_flow.emit_checkpoint_save(
@@ -564,11 +598,12 @@ index 4f9c55d2..cabe5d3d 100644
 +                checkpoint_id=self.checkpoint["id"],
 +            )
              self.prev_checkpoint_config = (
-                 self.checkpoint_config
-                 if CONFIG_KEY_CHECKPOINT_ID in self.checkpoint_config[CONF]
-@@ -1180,6 +1214,13 @@ class SyncPregelLoop(PregelLoop, AbstractContextManager):
-         self.checkpoint_id_saved = saved.checkpoint["id"]
-         self.checkpoint = saved.checkpoint
+@@ -974,2 +1008,4 @@ class PregelLoop:
+                 return
++            from langgraph import _nemo_flow
++            _nemo_flow.record_task_writes(self.step, task_id, writes)
+             if writes[0][0] == INTERRUPT:
+@@ -1182,2 +1218,9 @@ class SyncPregelLoop(PregelLoop, AbstractContextManager):
          self.checkpoint_metadata = saved.metadata
 +        if saved.checkpoint.get("channel_versions"):
 +            from langgraph import _nemo_flow
@@ -578,11 +613,7 @@ index 4f9c55d2..cabe5d3d 100644
 +                step=saved.metadata.get("step", -1) if saved.metadata else -1,
 +            )
          self.checkpoint_pending_writes = (
-             [(str(tid), k, v) for tid, k, v in saved.pending_writes]
-             if saved.pending_writes is not None
-@@ -1379,6 +1420,13 @@ class AsyncPregelLoop(PregelLoop, AbstractAsyncContextManager):
-         self.checkpoint_id_saved = saved.checkpoint["id"]
-         self.checkpoint = saved.checkpoint
+@@ -1381,2 +1424,9 @@ class AsyncPregelLoop(PregelLoop, AbstractAsyncContextManager):
          self.checkpoint_metadata = saved.metadata
 +        if saved.checkpoint.get("channel_versions"):
 +            from langgraph import _nemo_flow
@@ -592,15 +623,11 @@ index 4f9c55d2..cabe5d3d 100644
 +                step=saved.metadata.get("step", -1) if saved.metadata else -1,
 +            )
          self.checkpoint_pending_writes = (
-             [(str(tid), k, v) for tid, k, v in saved.pending_writes]
-             if saved.pending_writes is not None
 diff --git a/libs/langgraph/langgraph/pregel/_retry.py b/libs/langgraph/langgraph/pregel/_retry.py
-index 3c60f478..c92bccd7 100644
+index 3c60f478e..b081c9828 100644
 --- a/libs/langgraph/langgraph/pregel/_retry.py
 +++ b/libs/langgraph/langgraph/pregel/_retry.py
-@@ -76,83 +76,97 @@ def run_with_retry(
-                 )
-             },
+@@ -78,79 +78,96 @@ def run_with_retry(
          )
 -    while True:
 -        runtime = config.get(CONF, {}).get(CONFIG_KEY_RUNTIME)
@@ -644,7 +671,7 @@ index 3c60f478..c92bccd7 100644
 -                raise
 +    # --- NeMo Flow: node-level scope with per-branch isolation ---
 +    from langgraph import _nemo_flow
-
+ 
 -            # Check which retry policy applies to this exception
 -            matching_policy = None
 -            for policy in retry_policy:
@@ -654,8 +681,11 @@ index 3c60f478..c92bccd7 100644
 +    _branch_graph_handle = None
 +    _saved_stack = None
 +    if _nemo_flow.available():
++        depends_on_task_ids = _nemo_flow.dependency_task_ids_for_triggers(task.triggers)
 +        _node_handle, _branch_graph_handle, _saved_stack = _nemo_flow.push_node_scope(
-+            task.name, task.id
++            task.name,
++            task.id,
++            depends_on_task_ids=depends_on_task_ids,
 +        )
 +    try:
 +        while True:
@@ -719,7 +749,7 @@ index 3c60f478..c92bccd7 100644
 +                    if _should_retry_on(policy, exc):
 +                        matching_policy = policy
 +                        break
-
+ 
 -            # Apply jitter if configured
 -            sleep_time = (
 -                interval + random.uniform(0, 1) if matching_policy.jitter else interval
@@ -727,7 +757,7 @@ index 3c60f478..c92bccd7 100644
 -            time.sleep(sleep_time)
 +                if not matching_policy:
 +                    raise
-
+ 
 -            # log the retry
 -            logger.info(
 -                f"Retrying task {task.name} after {sleep_time:.2f} seconds (attempt {attempts}) after {exc.__class__.__name__} {exc}",
@@ -764,12 +794,8 @@ index 3c60f478..c92bccd7 100644
 +    finally:
 +        if _node_handle is not None:
 +            _nemo_flow.pop_node_scope(_node_handle, _branch_graph_handle, _saved_stack)
-
-
- async def arun_with_retry(
-@@ -185,90 +199,104 @@ async def arun_with_retry(
-             if t is task:
-                 # if the task is already cached, return
+ 
+@@ -187,86 +204,103 @@ async def arun_with_retry(
                  return
 -    while True:
 -        runtime = config.get(CONF, {}).get(CONFIG_KEY_RUNTIME)
@@ -819,7 +845,7 @@ index 3c60f478..c92bccd7 100644
 -                raise
 +    # --- NeMo Flow: node-level scope with per-branch isolation ---
 +    from langgraph import _nemo_flow
-
+ 
 -            # Check which retry policy applies to this exception
 -            matching_policy = None
 -            for policy in retry_policy:
@@ -829,8 +855,11 @@ index 3c60f478..c92bccd7 100644
 +    _branch_graph_handle = None
 +    _saved_stack = None
 +    if _nemo_flow.available():
++        depends_on_task_ids = _nemo_flow.dependency_task_ids_for_triggers(task.triggers)
 +        _node_handle, _branch_graph_handle, _saved_stack = _nemo_flow.push_node_scope(
-+            task.name, task.id
++            task.name,
++            task.id,
++            depends_on_task_ids=depends_on_task_ids,
 +        )
 +    try:
 +        while True:
@@ -901,7 +930,7 @@ index 3c60f478..c92bccd7 100644
 +                    if _should_retry_on(policy, exc):
 +                        matching_policy = policy
 +                        break
-
+ 
 -            # Apply jitter if configured
 -            sleep_time = (
 -                interval + random.uniform(0, 1) if matching_policy.jitter else interval
@@ -909,7 +938,7 @@ index 3c60f478..c92bccd7 100644
 -            await asyncio.sleep(sleep_time)
 +                if not matching_policy:
 +                    raise
-
+ 
 -            # log the retry
 -            logger.info(
 -                f"Retrying task {task.name} after {sleep_time:.2f} seconds (attempt {attempts}) after {exc.__class__.__name__} {exc}",
@@ -947,25 +976,17 @@ index 3c60f478..c92bccd7 100644
 +    finally:
 +        if _node_handle is not None:
 +            _nemo_flow.pop_node_scope(_node_handle, _branch_graph_handle, _saved_stack)
-
-
- def _should_retry_on(retry_policy: RetryPolicy, exc: Exception) -> bool:
+ 
 diff --git a/libs/langgraph/langgraph/pregel/_write.py b/libs/langgraph/langgraph/pregel/_write.py
-index 8b450825..01201606 100644
+index 8b4508257..825093b54 100644
 --- a/libs/langgraph/langgraph/pregel/_write.py
 +++ b/libs/langgraph/langgraph/pregel/_write.py
-@@ -10,7 +10,7 @@ from typing import (
-
- from langchain_core.runnables import Runnable, RunnableConfig
-
+@@ -12,3 +12,3 @@ from langchain_core.runnables import Runnable, RunnableConfig
+ 
 -from langgraph._internal._constants import CONF, CONFIG_KEY_SEND, TASKS
 +from langgraph._internal._constants import CONF, CONFIG_KEY_CHECKPOINT_NS, CONFIG_KEY_SEND, TASKS
  from langgraph._internal._runnable import RunnableCallable
- from langgraph._internal._typing import MISSING
- from langgraph.errors import InvalidUpdateError
-@@ -81,6 +81,21 @@ class ChannelWrite(RunnableCallable):
-             else write
-             for write in self.writes
+@@ -83,2 +83,17 @@ class ChannelWrite(RunnableCallable):
          ]
 +        from langgraph import _nemo_flow
 +        if _nemo_flow.available():
@@ -983,11 +1004,7 @@ index 8b450825..01201606 100644
 +                write_count=len(writes),
 +            )
          self.do_write(
-             config,
-             writes,
-@@ -96,6 +111,21 @@ class ChannelWrite(RunnableCallable):
-             else write
-             for write in self.writes
+@@ -98,2 +113,17 @@ class ChannelWrite(RunnableCallable):
          ]
 +        from langgraph import _nemo_flow
 +        if _nemo_flow.available():
@@ -1005,16 +1022,12 @@ index 8b450825..01201606 100644
 +                write_count=len(writes),
 +            )
          self.do_write(
-             config,
-             writes,
 diff --git a/libs/langgraph/langgraph/pregel/main.py b/libs/langgraph/langgraph/pregel/main.py
-index 8de321b8..64c0fd7f 100644
+index 8de321b84..8a9e0b5eb 100644
 --- a/libs/langgraph/langgraph/pregel/main.py
 +++ b/libs/langgraph/langgraph/pregel/main.py
-@@ -2570,6 +2570,36 @@ class Pregel(
-
-         stream = SyncQueue()
-
+@@ -2572,2 +2572,32 @@ class Pregel(
+ 
 +        # --- NeMo Flow: graph-level scope ---
 +        from langgraph import _nemo_flow
 +        from langgraph._internal._constants import CONFIG_KEY_TASK_ID, CONF
@@ -1046,11 +1059,7 @@ index 8de321b8..64c0fd7f 100644
 +                )
 +
          config = ensure_config(self.config, config)
-         callback_manager = get_callback_manager_for_config(config)
-         if "ls_integration" not in callback_manager.metadata:
-@@ -2772,6 +2802,14 @@ class Pregel(
-         except BaseException as e:
-             run_manager.on_chain_error(e)
+@@ -2774,2 +2804,10 @@ class Pregel(
              raise
 +        finally:
 +            if _graph_handle is not None:
@@ -1060,13 +1069,9 @@ index 8de321b8..64c0fd7f 100644
 +                    )
 +                else:
 +                    _nemo_flow.pop_graph_scope(_graph_handle)
-
-     @overload
-     def astream(
-@@ -2909,6 +2947,36 @@ class Pregel(
-             partial(aioloop.call_soon_threadsafe, stream.put_nowait),
-         )
-
+ 
+@@ -2911,2 +2949,32 @@ class Pregel(
+ 
 +        # --- NeMo Flow: graph-level scope ---
 +        from langgraph import _nemo_flow
 +        from langgraph._internal._constants import CONFIG_KEY_TASK_ID, CONF
@@ -1098,11 +1103,7 @@ index 8de321b8..64c0fd7f 100644
 +                )
 +
          config = ensure_config(self.config, config)
-         callback_manager = get_async_callback_manager_for_config(config)
-         if "ls_integration" not in callback_manager.metadata:
-@@ -3167,6 +3235,14 @@ class Pregel(
-         except BaseException as e:
-             await asyncio.shield(run_manager.on_chain_error(e))
+@@ -3169,2 +3237,10 @@ class Pregel(
              raise
 +        finally:
 +            if _graph_handle is not None:
@@ -1112,6 +1113,4 @@ index 8de321b8..64c0fd7f 100644
 +                    )
 +                else:
 +                    _nemo_flow.pop_graph_scope(_graph_handle)
-
-     @overload
-     def invoke(
+ 

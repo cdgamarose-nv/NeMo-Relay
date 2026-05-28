@@ -49,6 +49,7 @@ struct ScopeFacts {
     is_graph_node: bool,
     graph_node_name: Option<String>,
     graph_task_id: Option<String>,
+    graph_depends_on_task_ids: Vec<String>,
 }
 
 pub(crate) struct RunAccumulator {
@@ -236,6 +237,7 @@ impl RunAccumulator {
         let mut graph_name = None;
         let mut node_name = None;
         let mut task_id = None;
+        let mut depends_on_task_ids = Vec::new();
 
         for _ in 0..MAX_SCOPE_FACT_DEPTH {
             let facts = self.scope_facts.get(&current_uuid)?;
@@ -244,6 +246,7 @@ impl RunAccumulator {
             }
             if task_id.is_none() && facts.is_graph_node {
                 task_id = facts.graph_task_id.clone();
+                depends_on_task_ids = facts.graph_depends_on_task_ids.clone();
                 node_name = facts
                     .graph_node_name
                     .clone()
@@ -262,6 +265,7 @@ impl RunAccumulator {
             graph_name,
             node_name: node_name?,
             task_id: task_id?,
+            depends_on_task_ids,
         })
     }
 }
@@ -275,6 +279,7 @@ fn scope_facts(event: &Event) -> ScopeFacts {
         is_graph_node: graph.is_graph_node,
         graph_node_name: graph.node_name,
         graph_task_id: graph.task_id,
+        graph_depends_on_task_ids: graph.depends_on_task_ids,
     }
 }
 

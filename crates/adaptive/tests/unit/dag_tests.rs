@@ -293,6 +293,7 @@ fn completed_run_dag_uses_stable_graph_node_in_structural_key() {
         graph_name: Some("research_graph".to_string()),
         node_name: "researcher".to_string(),
         task_id: "task-1".to_string(),
+        depends_on_task_ids: Vec::new(),
     });
 
     let graph = build_completed_run_dag(&run(vec![call]));
@@ -309,6 +310,7 @@ fn graph_structural_key_excludes_run_local_task_id() {
         graph_name: Some("research_graph".to_string()),
         node_name: "researcher".to_string(),
         task_id: "task-1".to_string(),
+        depends_on_task_ids: Vec::new(),
     };
     let second_context = GraphCallContext {
         task_id: "task-2".to_string(),
@@ -323,6 +325,36 @@ fn graph_structural_key_excludes_run_local_task_id() {
     assert_eq!(first_key, second_key);
     assert!(!first_key.contains("task-1"));
     assert!(!first_key.contains("task-2"));
+}
+
+#[test]
+fn completed_run_dag_adds_graph_dependency_edges_from_task_ids() {
+    let base = Utc::now();
+    let mut source = call(CallKind::Llm, "source", base, 0, Some(50), None);
+    source.graph = Some(GraphCallContext {
+        graph_name: Some("research_graph".to_string()),
+        node_name: "source_node".to_string(),
+        task_id: "source-task".to_string(),
+        depends_on_task_ids: Vec::new(),
+    });
+    let mut dependent = call(CallKind::Llm, "dependent", base, 60, Some(100), None);
+    dependent.graph = Some(GraphCallContext {
+        graph_name: Some("research_graph".to_string()),
+        node_name: "dependent_node".to_string(),
+        task_id: "dependent-task".to_string(),
+        depends_on_task_ids: vec!["source-task".to_string()],
+    });
+
+    let graph = build_completed_run_dag(&run(vec![source, dependent]));
+
+    assert_eq!(
+        graph.edges,
+        vec![RunDagEdge {
+            from: 0,
+            to: 1,
+            kind: RunDagEdgeKind::GraphDependency,
+        }]
+    );
 }
 
 #[test]

@@ -394,6 +394,10 @@ pub(crate) struct RunDagNode {
     pub(crate) emitted_tool_call_ids: Vec<String>,
     /// Tool-call ids consumed as tool result messages by this LLM request.
     pub(crate) consumed_tool_call_ids: Vec<String>,
+    /// Graph task id for this call's enclosing graph node.
+    pub(crate) graph_task_id: Option<String>,
+    /// Graph task ids that this call's enclosing graph node depends on.
+    pub(crate) graph_depends_on_task_ids: Vec<String>,
 }
 
 /// Run-local dependency edge.
@@ -412,6 +416,8 @@ pub(crate) struct RunDagEdge {
 pub(crate) enum RunDagEdgeKind {
     /// A represented parent call completed before this child call started.
     ParentScope,
+    /// A graph node task depends on an earlier graph node task.
+    GraphDependency,
     /// An LLM request consumed a tool result emitted by an earlier LLM response.
     LlmToolResult,
     /// An LLM response requested a tool call later executed by a tool node.
@@ -461,12 +467,19 @@ pub(crate) fn build_completed_run_dag(run: &RunRecord) -> CompletedRunDag {
             tool_call_id: call.tool_call_id.clone(),
             emitted_tool_call_ids: emitted_tool_call_ids(call),
             consumed_tool_call_ids: consumed_tool_call_ids(call),
+            graph_task_id: call.graph.as_ref().map(|graph| graph.task_id.clone()),
+            graph_depends_on_task_ids: call
+                .graph
+                .as_ref()
+                .map(|graph| graph.depends_on_task_ids.clone())
+                .unwrap_or_default(),
         });
     }
 
     let mut edges = Vec::new();
     let mut seen_edges = HashSet::new();
     add_parent_scope_edges(&nodes, &mut edges, &mut seen_edges);
+    add_graph_dependency_edges(&nodes, &mut edges, &mut seen_edges);
     add_tool_call_edges(&nodes, &mut edges, &mut seen_edges);
     edges.sort_by_key(|edge| (edge.from, edge.to, edge.kind as u8));
 
@@ -857,6 +870,39 @@ fn add_parent_scope_edges(
             node.index,
             RunDagEdgeKind::ParentScope,
         );
+    }
+}
+
+fn add_graph_dependency_edges(
+    nodes: &[RunDagNode],
+    edges: &mut Vec<RunDagEdge>,
+    seen_edges: &mut HashSet<(usize, usize, RunDagEdgeKind)>,
+) {
+    let mut nodes_by_task_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    for node in nodes {
+        if let Some(task_id) = node.graph_task_id.as_deref() {
+            nodes_by_task_id.entry(task_id).or_default().push(node.index);
+        }
+    }
+
+    for node in nodes {
+        for task_id in &node.graph_depends_on_task_ids {
+            let Some(source_indices) = nodes_by_task_id.get(task_id.as_str()) else {
+                continue;
+            };
+            for &source_index in source_indices {
+                let source = &nodes[source_index];
+                if source.ended_at <= node.started_at {
+                    push_edge(
+                        edges,
+                        seen_edges,
+                        source.index,
+                        node.index,
+                        RunDagEdgeKind::GraphDependency,
+                    );
+                }
+            }
+        }
     }
 }
 

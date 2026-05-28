@@ -119,6 +119,7 @@ fn test_extract_graph_call_context_reads_generic_scope_metadata() {
                 "nemo_flow.graph.node": true,
                 "nemo_flow.graph.node_name": "researcher",
                 "nemo_flow.graph.task_id": "task-1",
+                "nemo_flow.graph.depends_on_task_ids": ["task-0"],
             }))
             .build(),
     )
@@ -129,6 +130,7 @@ fn test_extract_graph_call_context_reads_generic_scope_metadata() {
     assert_eq!(context.graph_name.as_deref(), Some("research_graph"));
     assert_eq!(context.node_name, "researcher");
     assert_eq!(context.task_id, "task-1");
+    assert_eq!(context.depends_on_task_ids, vec!["task-0"]);
 
     nemo_flow::api::scope::pop_scope(
         nemo_flow::api::scope::PopScopeParams::builder()
