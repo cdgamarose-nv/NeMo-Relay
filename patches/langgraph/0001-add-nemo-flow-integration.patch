@@ -84,6 +84,7 @@ index 00000000..ad15faba
 +
 +    graph_name: str
 +    metadata: dict
++    graph_handle: Any | None = None
 +    response_codec: object | None = None
 +
 +
@@ -92,6 +93,16 @@ index 00000000..ad15faba
 +_graph_scope_info: contextvars.ContextVar[_GraphScopeInfo | None] = (
 +    contextvars.ContextVar("_graph_scope_info", default=None)
 +)
++
++
++def _graph_scope_metadata(*, run_boundary: bool, subgraph: bool = False) -> dict[str, Any]:
++    metadata: dict[str, Any] = {
++        "nemo_flow.graph.scope": True,
++        "nemo_flow.run_boundary": run_boundary,
++    }
++    if subgraph:
++        metadata["nemo_flow.graph.subgraph"] = True
++    return metadata
 +
 +
 +# ---------------------------------------------------------------------------
@@ -162,10 +173,7 @@ index 00000000..ad15faba
 +
 +    Returns the ``ScopeHandle`` for the graph scope.
 +    """
-+    metadata: dict[str, Any] = {
-+        "langgraph.graph": True,
-+        "langgraph.scope_role": "root_graph",
-+    }
++    metadata = _graph_scope_metadata(run_boundary=True)
 +    if graph_topology is not None:
 +        metadata["graph_topology"] = graph_topology
 +    handle = nemo_flow.scope.push(
@@ -175,7 +183,12 @@ index 00000000..ad15faba
 +    )
 +    _langgraph_nemo_flow_active.set(True)
 +    _graph_scope_info.set(
-+        _GraphScopeInfo(graph_name=graph_name, metadata=metadata, response_codec=response_codec)
++        _GraphScopeInfo(
++            graph_name=graph_name,
++            metadata=metadata,
++            graph_handle=handle,
++            response_codec=response_codec,
++        )
 +    )
 +    return handle
 +
@@ -220,11 +233,13 @@ index 00000000..ad15faba
 +    # Push the graph-level scope on the branch stack (mirrors the parent)
 +    info = _graph_scope_info.get(None)
 +    graph_name = info.graph_name if info else "graph"
-+    graph_metadata = dict(info.metadata) if info else {"langgraph.graph": True}
-+    graph_metadata["langgraph.scope_role"] = "branch_graph"
++    graph_metadata = dict(info.metadata) if info else _graph_scope_metadata(run_boundary=False)
++    graph_metadata["nemo_flow.run_boundary"] = False
++    graph_parent = info.graph_handle if info else None
 +    graph_handle = nemo_flow.scope.push(
 +        graph_name,
 +        nemo_flow.ScopeType.Agent,
++        handle=graph_parent,
 +        metadata=graph_metadata,
 +    )
 +
@@ -233,10 +248,10 @@ index 00000000..ad15faba
 +        task_name,
 +        nemo_flow.ScopeType.Agent,
 +        metadata={
-+            "langgraph.node": True,
-+            "langgraph.scope_role": "node",
-+            "langgraph.task_id": task_id,
-+            "langgraph.node_name": task_name,
++            "nemo_flow.graph.node": True,
++            "nemo_flow.run_boundary": False,
++            "nemo_flow.graph.task_id": task_id,
++            "nemo_flow.graph.node_name": task_name,
 +        },
 +    )
 +    return node_handle, graph_handle, saved_token
@@ -278,17 +293,19 @@ index 00000000..ad15faba
 +    """
 +    # Save previous ContextVar values for restoration after subgraph completes
 +    active_token = _langgraph_nemo_flow_active.set(True)
-+    info_token = _graph_scope_info.set(
-+        _GraphScopeInfo(
-+            graph_name=graph_name,
-+            metadata={"langgraph.graph": True, "langgraph.subgraph": True},
-+            response_codec=response_codec,
-+        )
-+    )
++    metadata = _graph_scope_metadata(run_boundary=False, subgraph=True)
 +    handle = nemo_flow.scope.push(
 +        graph_name,
 +        nemo_flow.ScopeType.Agent,
-+        metadata={"langgraph.graph": True, "langgraph.subgraph": True},
++        metadata=metadata,
++    )
++    info_token = _graph_scope_info.set(
++        _GraphScopeInfo(
++            graph_name=graph_name,
++            metadata=metadata,
++            graph_handle=handle,
++            response_codec=response_codec,
++        )
 +    )
 +    return handle, active_token, info_token
 +

@@ -119,6 +119,32 @@ fn make_event(
     }
 }
 
+fn make_event_with_metadata(
+    event_type: EventType,
+    scope_type: ScopeType,
+    name: &str,
+    uuid: Uuid,
+    parent_uuid: Option<Uuid>,
+    metadata: serde_json::Value,
+) -> Event {
+    let scope_category = match event_type {
+        EventType::Start => ScopeCategory::Start,
+        EventType::End => ScopeCategory::End,
+    };
+    Event::Scope(ScopeEvent::new(
+        BaseEvent::builder()
+            .parent_uuid_opt(parent_uuid)
+            .uuid(uuid)
+            .name(name)
+            .metadata(metadata)
+            .build(),
+        scope_category,
+        Vec::new(),
+        EventCategory::from(scope_type),
+        None,
+    ))
+}
+
 /// Helper: make an Agent Start event whose own uuid acts as the inferred root.
 fn make_agent_start() -> Event {
     let uuid = Uuid::now_v7();
@@ -428,6 +454,118 @@ fn test_accumulator_tracks_non_agent_scope_roots_and_cleans_them_up() {
     );
     acc.process_event(&function_end, &[]);
     assert!(!acc.event_roots.contains_key(&function_uuid));
+}
+
+#[test]
+fn test_accumulator_tracks_nested_agent_scope_roots_and_cleans_them_up() {
+    let mut acc = RunAccumulator::new("agent-1".to_string());
+
+    let root_start = make_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "graph",
+        Uuid::now_v7(),
+        None,
+        json!({"nemo_flow.graph.scope": true, "nemo_flow.run_boundary": true}),
+    );
+    let root_uuid = root_start.uuid();
+    acc.process_event(&root_start, &[]);
+
+    let branch_uuid = Uuid::now_v7();
+    let branch_start = make_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "graph",
+        branch_uuid,
+        Some(root_uuid),
+        json!({"nemo_flow.graph.scope": true, "nemo_flow.run_boundary": false}),
+    );
+    acc.process_event(&branch_start, &[]);
+    assert_eq!(acc.event_roots.get(&branch_uuid), Some(&root_uuid));
+
+    let branch_end = make_event_with_metadata(
+        EventType::End,
+        ScopeType::Agent,
+        "graph",
+        branch_uuid,
+        Some(root_uuid),
+        json!({"nemo_flow.graph.scope": true, "nemo_flow.run_boundary": false}),
+    );
+    acc.process_event(&branch_end, &[]);
+    assert!(!acc.event_roots.contains_key(&branch_uuid));
+}
+
+#[test]
+fn test_accumulator_records_graph_call_context() {
+    let mut acc = RunAccumulator::new("agent-1".to_string());
+
+    let root_start = make_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "research_graph",
+        Uuid::now_v7(),
+        None,
+        json!({"nemo_flow.graph.scope": true, "nemo_flow.run_boundary": true}),
+    );
+    let root_uuid = root_start.uuid();
+    acc.process_event(&root_start, &[]);
+
+    let branch_uuid = Uuid::now_v7();
+    let branch_start = make_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "research_graph",
+        branch_uuid,
+        Some(root_uuid),
+        json!({"nemo_flow.graph.scope": true, "nemo_flow.run_boundary": false}),
+    );
+    acc.process_event(&branch_start, &[]);
+
+    let node_uuid = Uuid::now_v7();
+    let node_start = make_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "researcher",
+        node_uuid,
+        Some(branch_uuid),
+        json!({
+            "nemo_flow.graph.node": true,
+            "nemo_flow.run_boundary": false,
+            "nemo_flow.graph.task_id": "task-1",
+            "nemo_flow.graph.node_name": "researcher",
+        }),
+    );
+    acc.process_event(&node_start, &[]);
+
+    let llm_uuid = Uuid::now_v7();
+    let llm_start = make_event(
+        EventType::Start,
+        Some(ScopeType::Llm),
+        Some("gpt-4"),
+        llm_uuid,
+        Some(node_uuid),
+    );
+    acc.process_event(&llm_start, &[]);
+    let llm_end = make_event(
+        EventType::End,
+        Some(ScopeType::Llm),
+        Some("gpt-4"),
+        llm_uuid,
+        Some(node_uuid),
+    );
+    acc.process_event(&llm_end, &[]);
+
+    let run = acc
+        .process_event(&make_agent_end(root_uuid), &[])
+        .expect("root graph end should return completed run");
+    assert_eq!(run.calls.len(), 1);
+    let facts = run.calls[0]
+        .graph
+        .as_ref()
+        .expect("LLM call should carry graph context");
+    assert_eq!(facts.graph_name.as_deref(), Some("research_graph"));
+    assert_eq!(facts.node_name, "researcher");
+    assert_eq!(facts.task_id, "task-1");
 }
 
 #[test]

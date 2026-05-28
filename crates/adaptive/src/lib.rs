@@ -30,6 +30,7 @@ pub mod priority_residual;
 #[cfg(feature = "redis-backend")]
 pub mod redis;
 mod runtime;
+mod scope_metadata;
 /// Storage backends and backend traits for adaptive state persistence.
 pub mod storage;
 pub mod subscriber;

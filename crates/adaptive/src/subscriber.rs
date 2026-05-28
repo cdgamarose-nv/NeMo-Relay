@@ -9,6 +9,7 @@ use std::sync::{
 };
 
 use crate::context_helpers::extract_scope_path;
+use crate::scope_metadata::run_boundary_override;
 use crate::types::records::{CallKind, CallRecord, read_call_adaptive_hints};
 use nemo_flow::api::event::{Event, ScopeCategory};
 use nemo_flow::api::runtime::EventSubscriberFn;
@@ -69,19 +70,7 @@ pub(crate) fn is_run_boundary(event: &Event) -> bool {
         return false;
     }
 
-    match langgraph_scope_role(event) {
-        Some("root_graph") => true,
-        Some(_) => false,
-        None => true,
-    }
-}
-
-fn langgraph_scope_role(event: &Event) -> Option<&str> {
-    event
-        .metadata()?
-        .as_object()?
-        .get("langgraph.scope_role")?
-        .as_str()
+    run_boundary_override(event).unwrap_or(true)
 }
 
 #[cfg(test)]

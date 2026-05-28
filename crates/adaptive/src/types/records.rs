@@ -185,6 +185,9 @@ pub struct CallRecord {
     /// Runtime parent scope UUID for this call, when available.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parent_uuid: Option<Uuid>,
+    /// Compact graph node identity for calls issued inside a graph node.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub graph: Option<GraphCallContext>,
     /// Run-local ordinal for this call, starting at one.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub run_call_index: Option<u32>,
@@ -218,12 +221,28 @@ impl Default for CallRecord {
             annotated_response: None,
             function_path: vec![],
             parent_uuid: None,
+            graph: None,
             run_call_index: None,
             finish_reason: None,
             backend_timing: None,
             adaptive_hints: None,
         }
     }
+}
+
+/// Compact graph context for a call.
+///
+/// These facts are intentionally small: enough to reconstruct graph/node
+/// dependency structure without storing full framework metadata in every call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphCallContext {
+    /// Graph scope name, when available.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub graph_name: Option<String>,
+    /// Graph node name that issued this call.
+    pub node_name: String,
+    /// Graph task identifier for this node execution.
+    pub task_id: String,
 }
 
 /// Telemetry record for one observed agent run.

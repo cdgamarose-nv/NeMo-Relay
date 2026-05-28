@@ -14,10 +14,13 @@ use nemo_flow::api::scope::ScopeType;
 use uuid::Uuid;
 
 use crate::learner::traits::Learner;
+use crate::scope_metadata::scope_graph_metadata;
 use crate::storage::traits::StorageBackendDyn;
 use crate::subscriber::{event_to_call_record, is_run_boundary};
 use crate::types::cache::HotCache;
-use crate::types::records::{BackendTiming, CallKind, CallRecord, RunRecord};
+use crate::types::records::{BackendTiming, CallKind, CallRecord, GraphCallContext, RunRecord};
+
+const MAX_SCOPE_FACT_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct CallLocator {
@@ -38,11 +41,22 @@ struct CompletedRunCall {
     call: CallRecord,
 }
 
+#[derive(Debug, Clone)]
+struct ScopeFacts {
+    parent_uuid: Option<Uuid>,
+    name: String,
+    is_graph_scope: bool,
+    is_graph_node: bool,
+    graph_node_name: Option<String>,
+    graph_task_id: Option<String>,
+}
+
 pub(crate) struct RunAccumulator {
     agent_id: String,
     open_runs: HashMap<Uuid, RunRecord>,
     event_roots: HashMap<Uuid, Uuid>,
     open_call_index: HashMap<Uuid, CallLocator>,
+    scope_facts: HashMap<Uuid, ScopeFacts>,
 }
 
 impl RunAccumulator {
@@ -52,6 +66,7 @@ impl RunAccumulator {
             open_runs: HashMap::new(),
             event_roots: HashMap::new(),
             open_call_index: HashMap::new(),
+            scope_facts: HashMap::new(),
         }
     }
 
@@ -83,12 +98,12 @@ impl RunAccumulator {
                 completed_llm_call: self.track_call_end(event),
                 ..RunEventOutcome::default()
             },
-            (Some(ScopeCategory::Start), Some(scope_type)) => {
-                self.track_nested_scope_start(event, scope_type);
+            (Some(ScopeCategory::Start), Some(_)) => {
+                self.track_nested_scope_start(event);
                 RunEventOutcome::default()
             }
-            (Some(ScopeCategory::End), Some(scope_type)) => {
-                self.track_nested_scope_end(event, scope_type);
+            (Some(ScopeCategory::End), Some(_)) => {
+                self.track_nested_scope_end(event);
                 RunEventOutcome::default()
             }
             _ => RunEventOutcome::default(),
@@ -116,6 +131,7 @@ impl RunAccumulator {
     fn start_run(&mut self, event: &Event) {
         let root_uuid = event.uuid();
         self.event_roots.insert(root_uuid, root_uuid);
+        self.scope_facts.insert(root_uuid, scope_facts(event));
         let run = RunRecord {
             id: Uuid::now_v7(),
             agent_id: self.agent_id.clone(),
@@ -133,33 +149,37 @@ impl RunAccumulator {
             .unwrap_or_else(|| event.uuid());
         self.open_call_index
             .retain(|_, locator| locator.root_uuid != root_uuid);
+        self.event_roots
+            .retain(|_, mapped_root| *mapped_root != root_uuid);
+        self.scope_facts
+            .retain(|scope_uuid, _| self.event_roots.contains_key(scope_uuid));
         let mut run = self.open_runs.remove(&root_uuid)?;
         run.ended_at = Some(*event.timestamp());
         Some((root_uuid, run))
     }
 
-    fn track_nested_scope_start(&mut self, event: &Event, scope_type: ScopeType) -> Option<()> {
-        if scope_type != ScopeType::Agent {
-            let root_uuid = self.infer_root_uuid(event)?;
-            self.event_roots.insert(event.uuid(), root_uuid);
-        }
+    fn track_nested_scope_start(&mut self, event: &Event) -> Option<()> {
+        let root_uuid = self.infer_root_uuid(event)?;
+        self.event_roots.insert(event.uuid(), root_uuid);
+        self.scope_facts.insert(event.uuid(), scope_facts(event));
         Some(())
     }
 
-    fn track_nested_scope_end(&mut self, event: &Event, scope_type: ScopeType) {
-        if scope_type != ScopeType::Agent {
-            self.event_roots.remove(&event.uuid());
-        }
+    fn track_nested_scope_end(&mut self, event: &Event) {
+        self.event_roots.remove(&event.uuid());
+        self.scope_facts.remove(&event.uuid());
     }
 
     fn track_call_start(&mut self, event: &Event, scope_path: &[String]) -> Option<()> {
         let root_uuid = self.infer_root_uuid(event)?;
         self.event_roots.insert(event.uuid(), root_uuid);
+        let graph = self.graph_call_context(event.parent_uuid());
         if let Some(mut record) = event_to_call_record(event, scope_path)
             && let Some(run) = self.open_runs.get_mut(&root_uuid)
         {
             let call_index = run.calls.len();
             record.parent_uuid = event.parent_uuid();
+            record.graph = graph;
             record.run_call_index = Some(call_index as u32 + 1);
             run.calls.push(record);
             self.open_call_index.insert(
@@ -209,6 +229,52 @@ impl RunAccumulator {
                 .parent_uuid()
                 .and_then(|parent_uuid| self.event_roots.get(&parent_uuid).copied())
         })
+    }
+
+    fn graph_call_context(&self, parent_uuid: Option<Uuid>) -> Option<GraphCallContext> {
+        let mut current_uuid = parent_uuid?;
+        let mut graph_name = None;
+        let mut node_name = None;
+        let mut task_id = None;
+
+        for _ in 0..MAX_SCOPE_FACT_DEPTH {
+            let facts = self.scope_facts.get(&current_uuid)?;
+            if graph_name.is_none() && facts.is_graph_scope {
+                graph_name = Some(facts.name.clone());
+            }
+            if task_id.is_none() && facts.is_graph_node {
+                task_id = facts.graph_task_id.clone();
+                node_name = facts
+                    .graph_node_name
+                    .clone()
+                    .or_else(|| Some(facts.name.clone()));
+            }
+            if graph_name.is_some() && task_id.is_some() && node_name.is_some() {
+                break;
+            }
+            let Some(parent_uuid) = facts.parent_uuid else {
+                break;
+            };
+            current_uuid = parent_uuid;
+        }
+
+        Some(GraphCallContext {
+            graph_name,
+            node_name: node_name?,
+            task_id: task_id?,
+        })
+    }
+}
+
+fn scope_facts(event: &Event) -> ScopeFacts {
+    let graph = scope_graph_metadata(event);
+    ScopeFacts {
+        parent_uuid: event.parent_uuid(),
+        name: event.name().to_string(),
+        is_graph_scope: graph.is_graph_scope,
+        is_graph_node: graph.is_graph_node,
+        graph_node_name: graph.node_name,
+        graph_task_id: graph.task_id,
     }
 }
 

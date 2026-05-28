@@ -258,48 +258,48 @@ fn test_is_run_boundary_agent_mark() {
 }
 
 #[test]
-fn test_is_run_boundary_langgraph_root_graph() {
+fn test_is_run_boundary_explicit_graph_root() {
     let event = make_test_event_with_metadata(
         EventType::Start,
         ScopeType::Agent,
         "graph",
-        serde_json::json!({"langgraph.scope_role": "root_graph"}),
+        serde_json::json!({"nemo_flow.run_boundary": true}),
     );
     assert!(
         is_run_boundary(&event),
-        "LangGraph root graph Agent Start should be a run boundary"
+        "Agent Start with explicit run boundary should be a run boundary"
     );
 }
 
 #[test]
-fn test_is_run_boundary_langgraph_branch_graph() {
+fn test_is_run_boundary_explicit_nested_graph() {
     let event = make_test_event_with_metadata(
         EventType::Start,
         ScopeType::Agent,
         "graph",
-        serde_json::json!({"langgraph.scope_role": "branch_graph"}),
+        serde_json::json!({"nemo_flow.run_boundary": false}),
     );
     assert!(
         !is_run_boundary(&event),
-        "LangGraph branch graph Agent Start should NOT be a run boundary"
+        "Agent Start with explicit non-boundary metadata should NOT be a run boundary"
     );
 }
 
 #[test]
-fn test_is_run_boundary_langgraph_node() {
+fn test_is_run_boundary_explicit_graph_node() {
     let event = make_test_event_with_metadata(
         EventType::Start,
         ScopeType::Agent,
         "researcher",
         serde_json::json!({
-            "langgraph.scope_role": "node",
-            "langgraph.node": true,
-            "langgraph.task_id": "task-1",
+            "nemo_flow.run_boundary": false,
+            "nemo_flow.graph.node": true,
+            "nemo_flow.graph.task_id": "task-1",
         }),
     );
     assert!(
         !is_run_boundary(&event),
-        "LangGraph node Agent Start should NOT be a run boundary"
+        "Graph node Agent Start should NOT be a run boundary"
     );
 }
 
