@@ -60,11 +60,28 @@ pub(crate) fn event_to_call_record(event: &Event, scope_path: &[String]) -> Opti
 }
 
 pub(crate) fn is_run_boundary(event: &Event) -> bool {
-    event.scope_type() == Some(ScopeType::Agent)
-        && matches!(
+    if event.scope_type() != Some(ScopeType::Agent)
+        || !matches!(
             event.scope_category(),
             Some(ScopeCategory::Start | ScopeCategory::End)
         )
+    {
+        return false;
+    }
+
+    match langgraph_scope_role(event) {
+        Some("root_graph") => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+fn langgraph_scope_role(event: &Event) -> Option<&str> {
+    event
+        .metadata()?
+        .as_object()?
+        .get("langgraph.scope_role")?
+        .as_str()
 }
 
 #[cfg(test)]

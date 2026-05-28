@@ -49,6 +49,39 @@ fn make_test_event(
     }
 }
 
+fn make_test_event_with_metadata(
+    event_type: EventType,
+    scope_type: ScopeType,
+    name: &str,
+    metadata: serde_json::Value,
+) -> Event {
+    let scope_category = match event_type {
+        EventType::Start => ScopeCategory::Start,
+        EventType::End => ScopeCategory::End,
+        EventType::Mark => {
+            return Event::Mark(MarkEvent::new(
+                BaseEvent::builder()
+                    .name(name)
+                    .metadata(metadata)
+                    .build(),
+                None,
+                None,
+            ));
+        }
+    };
+
+    Event::Scope(ScopeEvent::new(
+        BaseEvent::builder()
+            .name(name)
+            .metadata(metadata)
+            .build(),
+        scope_category,
+        Vec::new(),
+        EventCategory::from(scope_type),
+        None,
+    ))
+}
+
 // -----------------------------------------------------------------------
 // create_subscriber tests
 // -----------------------------------------------------------------------
@@ -221,6 +254,52 @@ fn test_is_run_boundary_agent_mark() {
     assert!(
         !is_run_boundary(&event),
         "Agent Mark should NOT be a run boundary"
+    );
+}
+
+#[test]
+fn test_is_run_boundary_langgraph_root_graph() {
+    let event = make_test_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "graph",
+        serde_json::json!({"langgraph.scope_role": "root_graph"}),
+    );
+    assert!(
+        is_run_boundary(&event),
+        "LangGraph root graph Agent Start should be a run boundary"
+    );
+}
+
+#[test]
+fn test_is_run_boundary_langgraph_branch_graph() {
+    let event = make_test_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "graph",
+        serde_json::json!({"langgraph.scope_role": "branch_graph"}),
+    );
+    assert!(
+        !is_run_boundary(&event),
+        "LangGraph branch graph Agent Start should NOT be a run boundary"
+    );
+}
+
+#[test]
+fn test_is_run_boundary_langgraph_node() {
+    let event = make_test_event_with_metadata(
+        EventType::Start,
+        ScopeType::Agent,
+        "researcher",
+        serde_json::json!({
+            "langgraph.scope_role": "node",
+            "langgraph.node": true,
+            "langgraph.task_id": "task-1",
+        }),
+    );
+    assert!(
+        !is_run_boundary(&event),
+        "LangGraph node Agent Start should NOT be a run boundary"
     );
 }
 

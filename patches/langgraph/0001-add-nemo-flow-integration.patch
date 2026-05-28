@@ -162,7 +162,10 @@ index 00000000..ad15faba
 +
 +    Returns the ``ScopeHandle`` for the graph scope.
 +    """
-+    metadata: dict[str, Any] = {"langgraph.graph": True}
++    metadata: dict[str, Any] = {
++        "langgraph.graph": True,
++        "langgraph.scope_role": "root_graph",
++    }
 +    if graph_topology is not None:
 +        metadata["graph_topology"] = graph_topology
 +    handle = nemo_flow.scope.push(
@@ -217,7 +220,8 @@ index 00000000..ad15faba
 +    # Push the graph-level scope on the branch stack (mirrors the parent)
 +    info = _graph_scope_info.get(None)
 +    graph_name = info.graph_name if info else "graph"
-+    graph_metadata = info.metadata if info else {"langgraph.graph": True}
++    graph_metadata = dict(info.metadata) if info else {"langgraph.graph": True}
++    graph_metadata["langgraph.scope_role"] = "branch_graph"
 +    graph_handle = nemo_flow.scope.push(
 +        graph_name,
 +        nemo_flow.ScopeType.Agent,
@@ -228,7 +232,12 @@ index 00000000..ad15faba
 +    node_handle = nemo_flow.scope.push(
 +        task_name,
 +        nemo_flow.ScopeType.Agent,
-+        metadata={"langgraph.node": True, "langgraph.task_id": task_id},
++        metadata={
++            "langgraph.node": True,
++            "langgraph.scope_role": "node",
++            "langgraph.task_id": task_id,
++            "langgraph.node_name": task_name,
++        },
 +    )
 +    return node_handle, graph_handle, saved_token
 +
