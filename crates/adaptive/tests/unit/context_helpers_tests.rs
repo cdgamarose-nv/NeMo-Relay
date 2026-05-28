@@ -99,6 +99,71 @@ fn test_read_workflow_class_reads_nearest_scope_metadata() {
 }
 
 #[test]
+fn test_extract_graph_call_context_reads_generic_scope_metadata() {
+    set_thread_scope_stack(create_scope_stack());
+    let graph_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("research_graph")
+            .scope_type(ScopeType::Agent)
+            .metadata(serde_json::json!({
+                "nemo_flow.graph.scope": true,
+            }))
+            .build(),
+    )
+    .unwrap();
+    let node_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("researcher")
+            .scope_type(ScopeType::Agent)
+            .metadata(serde_json::json!({
+                "nemo_flow.graph.node": true,
+                "nemo_flow.graph.node_name": "researcher",
+                "nemo_flow.graph.task_id": "task-1",
+            }))
+            .build(),
+    )
+    .unwrap();
+
+    let context = extract_graph_call_context().unwrap();
+
+    assert_eq!(context.graph_name.as_deref(), Some("research_graph"));
+    assert_eq!(context.node_name, "researcher");
+    assert_eq!(context.task_id, "task-1");
+
+    nemo_flow::api::scope::pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&node_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    nemo_flow::api::scope::pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&graph_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    set_thread_scope_stack(create_scope_stack());
+}
+
+#[test]
+fn test_extract_graph_call_context_requires_task_id() {
+    set_thread_scope_stack(create_scope_stack());
+    let _node_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("researcher")
+            .scope_type(ScopeType::Agent)
+            .metadata(serde_json::json!({
+                "nemo_flow.graph.node": true,
+            }))
+            .build(),
+    )
+    .unwrap();
+
+    assert_eq!(extract_graph_call_context(), None);
+    set_thread_scope_stack(create_scope_stack());
+}
+
+#[test]
 fn test_helpers_return_defaults_when_scope_stack_lock_is_poisoned() {
     let poisoned = create_scope_stack();
     let poisoned_for_panic = poisoned.clone();
@@ -111,6 +176,7 @@ fn test_helpers_return_defaults_when_scope_stack_lock_is_poisoned() {
     assert!(extract_scope_path().is_empty());
     assert_eq!(read_manual_latency_sensitivity(), None);
     assert_eq!(read_workflow_class(), None);
+    assert_eq!(extract_graph_call_context(), None);
     assert_eq!(resolve_agent_id(), None);
     assert_eq!(resolve_root_scope_uuid(), None);
 

@@ -7,6 +7,7 @@
 //! to extract information needed by the LLM request intercept:
 //!
 //! - [`extract_scope_path`]: collects function names from the scope stack for trie lookup
+//! - [`extract_graph_call_context`]: reads generic graph/node metadata for DAG CPM lookup
 //! - [`read_manual_latency_sensitivity`]: walks all scopes for manual `latency_sensitive` annotations
 //! - [`read_workflow_class`]: reads workflow scheduling class metadata for priority caps
 //! - [`resolve_agent_id`]: returns the first Agent scope name from the scope stack
@@ -28,6 +29,9 @@
 use nemo_flow::api::runtime::current_scope_stack;
 use nemo_flow::api::scope::ScopeType;
 use uuid::Uuid;
+
+use crate::scope_metadata::scope_graph_metadata_from_value;
+use crate::types::records::GraphCallContext;
 
 /// Metadata key path for manual latency sensitivity annotation.
 pub const LATENCY_SENSITIVITY_POINTER: &str = "/nemo_flow_adaptive/latency_sensitivity";
@@ -92,6 +96,42 @@ pub fn extract_scope_path() -> Vec<String> {
         .filter(|s| matches!(s.scope_type, ScopeType::Agent | ScopeType::Function))
         .map(|s| s.name.clone())
         .collect()
+}
+
+/// Extracts compact graph context for the current LLM call, when present.
+///
+/// This reads generic `nemo_flow.graph.*` scope metadata emitted by framework
+/// integrations. The returned context matches completed-run call records:
+/// graph name is optional, while node name and task id are required.
+pub(crate) fn extract_graph_call_context() -> Option<GraphCallContext> {
+    let stack_handle = current_scope_stack();
+    let stack = match stack_handle.read() {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let mut graph_name = None;
+    let mut node_name = None;
+    let mut task_id = None;
+    for scope in stack.scopes().iter().rev() {
+        let graph = scope_graph_metadata_from_value(&scope.name, scope.metadata.as_ref());
+        if task_id.is_none() && graph.is_graph_node {
+            task_id = graph.task_id;
+            node_name = graph.node_name;
+        }
+        if graph_name.is_none() && graph.is_graph_scope {
+            graph_name = Some(scope.name.clone());
+        }
+        if graph_name.is_some() && task_id.is_some() && node_name.is_some() {
+            break;
+        }
+    }
+
+    Some(GraphCallContext {
+        graph_name,
+        node_name: node_name?,
+        task_id: task_id?,
+    })
 }
 
 /// Reads the maximum manual latency sensitivity from all scopes in the current scope stack.

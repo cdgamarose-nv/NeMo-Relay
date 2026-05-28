@@ -18,7 +18,7 @@ use crate::learner::traits::Learner;
 use crate::model::model_bucket;
 use crate::storage::traits::StorageBackendDyn;
 use crate::types::cache::HotCache;
-use crate::types::records::{CallKind, CallRecord, RunRecord};
+use crate::types::records::{CallKind, CallRecord, GraphCallContext, RunRecord};
 
 const JUMP_UNIT_MS: f64 = 1000.0;
 const DEFAULT_QUEUE_HORIZON_MS: f64 = 3000.0;
@@ -667,7 +667,7 @@ fn structural_key(call: &CallRecord) -> String {
         CallKind::Llm => "llm",
         CallKind::Tool => "tool",
     };
-    structural_key_parts(kind, &call.function_path, &call.name)
+    structural_key_parts(kind, &call.function_path, &call.name, call.graph.as_ref())
 }
 
 fn call_model_bucket(call: &CallRecord) -> String {
@@ -680,9 +680,13 @@ fn call_model_bucket(call: &CallRecord) -> String {
     model_bucket(model_name)
 }
 
-/// Build the learned structural key for a hot-path LLM request.
-pub(crate) fn llm_structural_key(function_path: &[String], name: &str) -> String {
-    structural_key_parts("llm", function_path, name)
+/// Build the learned structural key for a hot-path graph LLM request.
+pub(crate) fn llm_structural_key_with_graph(
+    function_path: &[String],
+    name: &str,
+    graph: Option<&GraphCallContext>,
+) -> String {
+    structural_key_parts("llm", function_path, name, graph)
 }
 
 /// Project learned CPM criticality onto the bounded backend priority scale.
@@ -704,12 +708,26 @@ pub(crate) fn project_priority_prior(
     Some(priority.clamp(0, priority_cap as i32) as u32)
 }
 
-fn structural_key_parts(kind: &str, function_path: &[String], name: &str) -> String {
+fn structural_key_parts(
+    kind: &str,
+    function_path: &[String],
+    name: &str,
+    graph: Option<&GraphCallContext>,
+) -> String {
     let path = if function_path.is_empty() {
         "root".to_string()
     } else {
         function_path.join("/")
     };
+    if let Some(graph) = graph {
+        let node_name = graph.node_name.as_str();
+        return match graph.graph_name.as_deref() {
+            Some(graph_name) => {
+                format!("{path}/graph:{graph_name}/node:{node_name}/{kind}:{name}")
+            },
+            None => format!("{path}/node:{node_name}/{kind}:{name}"),
+        };
+    }
     format!("{path}/{kind}:{name}")
 }
 

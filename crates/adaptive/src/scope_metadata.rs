@@ -4,6 +4,7 @@
 //! Generic scope metadata keys consumed by adaptive telemetry.
 
 use nemo_flow::api::event::Event;
+use serde_json::Value;
 
 const RUN_BOUNDARY_KEY: &str = "nemo_flow.run_boundary";
 const GRAPH_SCOPE_KEY: &str = "nemo_flow.graph.scope";
@@ -24,27 +25,38 @@ pub(crate) fn run_boundary_override(event: &Event) -> Option<bool> {
 }
 
 pub(crate) fn scope_graph_metadata(event: &Event) -> ScopeGraphMetadata {
+    scope_graph_metadata_from_value(event.name(), event.metadata())
+}
+
+pub(crate) fn scope_graph_metadata_from_value(
+    scope_name: &str,
+    metadata: Option<&Value>,
+) -> ScopeGraphMetadata {
+    let is_graph_node = metadata_bool_value(metadata, GRAPH_NODE_KEY).unwrap_or(false);
     ScopeGraphMetadata {
-        is_graph_scope: metadata_bool(event, GRAPH_SCOPE_KEY).unwrap_or(false),
-        is_graph_node: metadata_bool(event, GRAPH_NODE_KEY).unwrap_or(false),
-        node_name: metadata_str(event, GRAPH_NODE_NAME_KEY),
-        task_id: metadata_str(event, GRAPH_TASK_ID_KEY),
+        is_graph_scope: metadata_bool_value(metadata, GRAPH_SCOPE_KEY).unwrap_or(false),
+        is_graph_node,
+        node_name: metadata_str_value(metadata, GRAPH_NODE_NAME_KEY)
+            .or_else(|| is_graph_node.then(|| scope_name.to_string())),
+        task_id: metadata_str_value(metadata, GRAPH_TASK_ID_KEY),
     }
 }
 
 fn metadata_bool(event: &Event, key: &str) -> Option<bool> {
-    event
-        .metadata()
-        .and_then(serde_json::Value::as_object)
-        .and_then(|object| object.get(key))
-        .and_then(serde_json::Value::as_bool)
+    metadata_bool_value(event.metadata(), key)
 }
 
-fn metadata_str(event: &Event, key: &str) -> Option<String> {
-    event
-        .metadata()
-        .and_then(serde_json::Value::as_object)
+fn metadata_bool_value(metadata: Option<&Value>, key: &str) -> Option<bool> {
+    metadata
+        .and_then(Value::as_object)
         .and_then(|object| object.get(key))
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_bool)
+}
+
+fn metadata_str_value(metadata: Option<&Value>, key: &str) -> Option<String> {
+    metadata
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_str)
         .map(str::to_string)
 }

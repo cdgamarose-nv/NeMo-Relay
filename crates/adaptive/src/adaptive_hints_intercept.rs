@@ -18,11 +18,11 @@ use nemo_flow::codec::request::{AnnotatedLlmRequest, Message};
 use serde_json::{Map, Value};
 
 use crate::context_helpers::{
-    extract_scope_path, read_manual_latency_sensitivity, read_workflow_class, resolve_agent_id,
-    resolve_root_scope_uuid, WorkflowClass,
+    extract_graph_call_context, extract_scope_path, read_manual_latency_sensitivity,
+    read_workflow_class, resolve_agent_id, resolve_root_scope_uuid, WorkflowClass,
 };
 use crate::dag::{
-    llm_structural_key, project_priority_prior, DagCpmState, DEFAULT_DAG_PRIORITY_CAP,
+    llm_structural_key_with_graph, project_priority_prior, DagCpmState, DEFAULT_DAG_PRIORITY_CAP,
     MAX_DAG_PRIORITY_CAP,
 };
 use crate::intercepts::AGENT_HINTS_HEADER_KEY;
@@ -32,7 +32,7 @@ use crate::trie::builder::SensitivityConfig;
 use crate::trie::lookup::PredictionTrieLookup;
 use crate::types::cache::HotCache;
 use crate::types::metadata::AgentHints;
-use crate::types::records::{write_call_adaptive_hints, CallAdaptiveHints};
+use crate::types::records::{write_call_adaptive_hints, CallAdaptiveHints, GraphCallContext};
 use uuid::Uuid;
 
 const DEFAULT_PRIORITY_ADJUSTMENT: i32 = 0;
@@ -461,6 +461,7 @@ impl AdaptiveHintsIntercept {
         priority_cap: u32,
         annotated: Option<&AnnotatedLlmRequest>,
         root_uuid: Option<Uuid>,
+        graph_context: Option<&GraphCallContext>,
     ) -> HintSelection {
         let Ok(cache_guard) = self.hot_cache.read() else {
             return HintSelection::default();
@@ -480,7 +481,7 @@ impl AdaptiveHintsIntercept {
             cache_guard.agent_hints_default.clone()
         };
 
-        let structural_key = llm_structural_key(scope_path, llm_name);
+        let structural_key = llm_structural_key_with_graph(scope_path, llm_name, graph_context);
         let fallback_priority = cache_guard.dag_cpm.as_ref().and_then(|_| {
             fallback_priority_prior(annotated, call_index, scope_depth, priority_cap)
         });
@@ -526,6 +527,7 @@ impl AdaptiveHintsIntercept {
                 let manual_ls = read_manual_latency_sensitivity();
                 let priority_cap = priority_cap_for_workflow_class(read_workflow_class());
                 let root_uuid = resolve_root_scope_uuid();
+                let graph_context = extract_graph_call_context();
                 let scope_depth = scope_path.len();
                 let call_index = this.call_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -539,6 +541,7 @@ impl AdaptiveHintsIntercept {
                     priority_cap,
                     annotated.as_ref(),
                     root_uuid,
+                    graph_context.as_ref(),
                 );
                 let final_hints = apply_manual_latency_override(
                     selection.hints.take(),

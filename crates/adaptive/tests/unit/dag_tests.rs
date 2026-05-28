@@ -13,7 +13,7 @@ use crate::learner::traits::Learner;
 use crate::storage::memory::InMemoryBackend;
 use crate::storage::traits::StorageBackendDyn;
 use crate::types::cache::HotCache;
-use crate::types::records::{BackendTiming, CallRecord, RunRecord};
+use crate::types::records::{BackendTiming, CallRecord, GraphCallContext, RunRecord};
 
 fn call(
     kind: CallKind,
@@ -283,6 +283,46 @@ fn completed_run_dag_keeps_run_call_index_separate_from_structural_key() {
     assert_eq!(graph.nodes[1].structural_key, "agent/llm:branch");
     assert_eq!(graph.nodes[0].run_call_index, Some(3));
     assert_eq!(graph.nodes[1].run_call_index, Some(4));
+}
+
+#[test]
+fn completed_run_dag_uses_stable_graph_node_in_structural_key() {
+    let base = Utc::now();
+    let mut call = call(CallKind::Llm, "ChatNVIDIA", base, 0, Some(50), None);
+    call.graph = Some(GraphCallContext {
+        graph_name: Some("research_graph".to_string()),
+        node_name: "researcher".to_string(),
+        task_id: "task-1".to_string(),
+    });
+
+    let graph = build_completed_run_dag(&run(vec![call]));
+
+    assert_eq!(
+        graph.nodes[0].structural_key,
+        "agent/graph:research_graph/node:researcher/llm:ChatNVIDIA"
+    );
+}
+
+#[test]
+fn graph_structural_key_excludes_run_local_task_id() {
+    let first_context = GraphCallContext {
+        graph_name: Some("research_graph".to_string()),
+        node_name: "researcher".to_string(),
+        task_id: "task-1".to_string(),
+    };
+    let second_context = GraphCallContext {
+        task_id: "task-2".to_string(),
+        ..first_context.clone()
+    };
+
+    let first_key =
+        llm_structural_key_with_graph(&["agent".to_string()], "ChatNVIDIA", Some(&first_context));
+    let second_key =
+        llm_structural_key_with_graph(&["agent".to_string()], "ChatNVIDIA", Some(&second_context));
+
+    assert_eq!(first_key, second_key);
+    assert!(!first_key.contains("task-1"));
+    assert!(!first_key.contains("task-2"));
 }
 
 #[test]
