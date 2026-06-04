@@ -60,10 +60,7 @@ fn make_test_event_with_metadata(
         EventType::End => ScopeCategory::End,
         EventType::Mark => {
             return Event::Mark(MarkEvent::new(
-                BaseEvent::builder()
-                    .name(name)
-                    .metadata(metadata)
-                    .build(),
+                BaseEvent::builder().name(name).metadata(metadata).build(),
                 None,
                 None,
             ));
@@ -71,10 +68,7 @@ fn make_test_event_with_metadata(
     };
 
     Event::Scope(ScopeEvent::new(
-        BaseEvent::builder()
-            .name(name)
-            .metadata(metadata)
-            .build(),
+        BaseEvent::builder().name(name).metadata(metadata).build(),
         scope_category,
         Vec::new(),
         EventCategory::from(scope_type),

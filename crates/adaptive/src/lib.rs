@@ -45,9 +45,9 @@ pub use config::{
     TelemetryComponentConfig, ToolParallelismComponentConfig,
 };
 pub use context_helpers::{
-    LATENCY_SENSITIVITY_POINTER, WorkflowClass, extract_scope_path,
+    LATENCY_SENSITIVITY_POINTER, RUN_BOUNDARY_POINTER, WorkflowClass, extract_scope_path,
     read_manual_latency_sensitivity, read_workflow_class, resolve_agent_id,
-    resolve_shared_parent_scope_identity, set_latency_sensitivity,
+    resolve_run_boundary_scope_uuid, resolve_shared_parent_scope_identity, set_latency_sensitivity,
 };
 pub use error::{AdaptiveError, Result};
 #[cfg(feature = "redis-backend")]

@@ -17,7 +17,7 @@ use crate::priority_residual::{
 };
 use crate::trie::data_models::{LlmCallPrediction, PredictionMetrics};
 use chrono::Utc;
-use nemo_flow::api::runtime::current_scope_stack;
+use nemo_flow::api::runtime::{create_scope_stack, current_scope_stack, set_thread_scope_stack};
 use nemo_flow::api::scope::ScopeType;
 use nemo_flow::api::scope::{pop_scope, push_scope};
 use nemo_flow::codec::request::{AnnotatedLlmRequest, GenerationParams, Message, MessageContent};
@@ -423,10 +423,12 @@ fn test_adaptive_hints_intercept_uses_defaults_and_ignores_poisoned_cache() {
         None,
     )
     .unwrap();
-    assert!(poisoned_request
-        .headers
-        .get(AGENT_HINTS_HEADER_KEY)
-        .is_none());
+    assert!(
+        poisoned_request
+            .headers
+            .get(AGENT_HINTS_HEADER_KEY)
+            .is_none()
+    );
     assert_eq!(
         poisoned_request.content,
         serde_json::json!({"existing": true, "nvext": {"extra_fields": ["timing"]}})
@@ -617,10 +619,12 @@ fn test_adaptive_hints_intercept_records_omitted_empirical_osl_without_emitting_
         returned_annotated.extra["nvext"]["extra_fields"],
         serde_json::json!(["timing"])
     );
-    assert!(returned_annotated.extra["nvext"]
-        .as_object()
-        .and_then(|nvext| nvext.get("agent_hints"))
-        .is_none());
+    assert!(
+        returned_annotated.extra["nvext"]
+            .as_object()
+            .and_then(|nvext| nvext.get("agent_hints"))
+            .is_none()
+    );
     let adaptive_hints =
         &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
     assert_eq!(
@@ -806,6 +810,78 @@ fn test_adaptive_hints_intercept_empirical_osl_prefers_run_local_samples() {
     assert_eq!(adaptive_hints["emitted_osl"], serde_json::json!(30));
 
     reset_root_metadata();
+}
+
+#[test]
+fn test_adaptive_hints_intercept_uses_agent_boundary_for_run_local_osl() {
+    let _guard = test_mutex().lock().unwrap();
+    set_thread_scope_stack(create_scope_stack());
+
+    let annotated = annotated_with_messages(vec![Message::User {
+        content: MessageContent::Text("hello".into()),
+        name: None,
+    }]);
+    let agent_scope = push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("aiq.chat")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+    let implicit_root_uuid = current_scope_stack().read().unwrap().root_uuid();
+    assert_ne!(agent_scope.uuid, implicit_root_uuid);
+
+    let osl_empirical = empirical_state_with_run_samples(
+        "fallback-agent",
+        agent_scope.uuid,
+        &annotated,
+        [10, 20, 30],
+    );
+    let hot_cache = Arc::new(RwLock::new(HotCache {
+        plan: None,
+        trie: None,
+        agent_hints_default: None,
+        dag_cpm: None,
+        priority_residual: None,
+        osl_empirical: Some(osl_empirical),
+        acg_profiles: HashMap::new(),
+        acg_profile_observation_counts: HashMap::new(),
+        acg_stability: None,
+        acg_observation_count: 0,
+    }));
+    let req_fn =
+        AdaptiveHintsIntercept::new(hot_cache, "fallback-agent".to_string()).into_request_fn();
+
+    let (request, returned_annotated) = req_fn(
+        "model",
+        LlmRequest {
+            headers: serde_json::Map::new(),
+            content: serde_json::json!({}),
+        },
+        Some(annotated),
+    )
+    .unwrap();
+
+    assert_eq!(
+        request.content["nvext"]["agent_hints"]["osl"],
+        serde_json::json!(30)
+    );
+    let returned_annotated = returned_annotated.unwrap();
+    let adaptive_hints =
+        &returned_annotated.extra.get("_nemo_flow_internal").unwrap()["adaptive_hints"];
+    assert_eq!(
+        adaptive_hints["selected_osl_source"],
+        serde_json::json!("run_local")
+    );
+    assert_eq!(adaptive_hints["emitted_osl"], serde_json::json!(30));
+
+    pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&agent_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    set_thread_scope_stack(create_scope_stack());
 }
 
 #[test]

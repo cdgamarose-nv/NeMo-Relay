@@ -37,6 +37,7 @@ from nemo_flow._native import (
 from nemo_flow._native import (
     tool_request_intercepts as _native_tool_request_intercepts,
 )
+from nemo_flow.scope import _ensure_scope_stack
 
 
 def call(
@@ -95,6 +96,7 @@ def call(
             metadata={"status": "success"},
         )
     """
+    _ensure_scope_stack()
     return _native_tool_call(
         name,
         args,
@@ -127,6 +129,7 @@ def call_end(handle, result, *, data=None, metadata=None, timestamp: datetime | 
         ``timestamp`` must be a timezone-aware ``datetime``; strings and naive
         datetimes are rejected.
     """
+    _ensure_scope_stack()
     return _native_tool_call_end(handle, result, data=data, metadata=metadata, timestamp=timestamp)
 
 
@@ -179,6 +182,7 @@ def execute(name, args, func, *, handle=None, attributes=None, data=None, metada
         )
         assert result["count"] == 3
     """
+    _ensure_scope_stack()
     return _native_tool_call_execute(
         name, args, func, handle=handle, attributes=attributes, data=data, metadata=metadata
     )
@@ -198,6 +202,7 @@ def request_intercepts(name, args):
         This runs only the request-intercept chain. It does not execute
         conditional guardrails, sanitize guardrails, or the tool callback.
     """
+    _ensure_scope_stack()
     return _native_tool_request_intercepts(name, args)
 
 
@@ -216,6 +221,7 @@ def conditional_execution(name, args):
         This helper evaluates only the conditional-execution guardrail chain
         and does not invoke request intercepts or tool execution.
     """
+    _ensure_scope_stack()
     return _native_tool_conditional_execution(name, args)
 
 

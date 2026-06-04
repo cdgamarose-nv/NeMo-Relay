@@ -1,0 +1,501 @@
+diff --git a/libs/langgraph/langgraph/_nemo_flow.py b/libs/langgraph/langgraph/_nemo_flow.py
+new file mode 100644
+index 0000000..a4d4376
+--- /dev/null
++++ b/libs/langgraph/langgraph/_nemo_flow.py
+@@ -0,0 +1,277 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++"""Optional NeMo Flow hooks for LangGraph dependency metadata."""
++
++from __future__ import annotations
++
++import contextvars
++import logging
++from typing import Any, NamedTuple
++
++_logger = logging.getLogger(__name__)
++
++try:
++    import nemo_flow
++
++    _HAS_NEMO_FLOW = True
++except ImportError:  # pragma: no cover
++    nemo_flow = None  # type: ignore[assignment]
++    _HAS_NEMO_FLOW = False
++
++
++class _GraphScopeInfo(NamedTuple):
++    graph_name: str
++    metadata: dict[str, Any]
++    graph_handle: Any | None = None
++    inherited_depends_on_task_ids: tuple[str, ...] = ()
++
++
++class _GraphScopeRestore(NamedTuple):
++    info_token: contextvars.Token
++    writers_token: contextvars.Token
++
++
++class _NodeDependencyContext(NamedTuple):
++    task_id: str
++    depends_on_task_ids: tuple[str, ...]
++
++
++class _BranchScopeRestore(NamedTuple):
++    context_token: contextvars.Token
++    parent_stack: Any
++    node_context_token: contextvars.Token
++
++
++_graph_scope_info: contextvars.ContextVar[_GraphScopeInfo | None] = (
++    contextvars.ContextVar("_graph_scope_info", default=None)
++)
++_graph_channel_writers: contextvars.ContextVar[dict[str, tuple[int, list[str]]]] = (
++    contextvars.ContextVar("_graph_channel_writers", default={})
++)
++_graph_scope_restores: contextvars.ContextVar[dict[int, _GraphScopeRestore]] = (
++    contextvars.ContextVar("_graph_scope_restores", default={})
++)
++_current_node_context: contextvars.ContextVar[_NodeDependencyContext | None] = (
++    contextvars.ContextVar("_current_node_context", default=None)
++)
++
++_NULL_TASK_ID = "00000000-0000-0000-0000-000000000000"
++_SPECIAL_WRITE_CHANNELS = {
++    "__error__",
++    "__interrupt__",
++    "__no_writes__",
++    "__pregel_push",
++    "__pregel_tasks",
++    "__resume__",
++    "__return__",
++}
++
++_INHERITED_ADAPTIVE_KEYS = {
++    "workflow_class",
++    "scheduling_class",
++    "latency_sensitivity",
++}
++
++
++def _adaptive_metadata_from(metadata: Any) -> dict[str, Any]:
++    if not isinstance(metadata, dict):
++        return {}
++    adaptive_metadata = metadata.get("nemo_flow_adaptive")
++    if not isinstance(adaptive_metadata, dict):
++        return {}
++    inherited = {
++        key: adaptive_metadata[key]
++        for key in _INHERITED_ADAPTIVE_KEYS
++        if key in adaptive_metadata
++    }
++    if not inherited:
++        return {}
++    return {"nemo_flow_adaptive": inherited}
++
++
++def _inherited_adaptive_metadata() -> dict[str, Any]:
++    try:
++        parent = nemo_flow.scope.get_handle()
++        metadata = _adaptive_metadata_from(getattr(parent, "metadata", None))
++        if metadata:
++            return metadata
++    except Exception:
++        pass
++
++    info = _graph_scope_info.get(None)
++    if info is not None:
++        metadata = _adaptive_metadata_from(info.metadata)
++        if metadata:
++            return metadata
++
++    return {}
++
++
++def available() -> bool:
++    if not _HAS_NEMO_FLOW:
++        return False
++    try:
++        return nemo_flow.scope_stack_active()
++    except Exception:
++        return False
++
++
++def _graph_scope_metadata(*, run_boundary: bool) -> dict[str, Any]:
++    return {
++        **_inherited_adaptive_metadata(),
++        "nemo_flow.graph.scope": True,
++        "nemo_flow.run_boundary": run_boundary,
++    }
++
++
++def _merge_task_ids(*groups: tuple[str, ...] | list[str] | None) -> list[str]:
++    merged: list[str] = []
++    for group in groups:
++        for task_id in group or ():
++            if task_id not in merged:
++                merged.append(task_id)
++    return merged
++
++
++def push_graph_scope(graph_name: str) -> Any:
++    parent_node = _current_node_context.get(None)
++    is_nested = parent_node is not None
++    inherited_depends_on_task_ids = (
++        parent_node.depends_on_task_ids if parent_node is not None else ()
++    )
++    metadata = _graph_scope_metadata(run_boundary=not is_nested)
++    if is_nested:
++        metadata["nemo_flow.graph.subgraph"] = True
++    handle = nemo_flow.scope.push(
++        graph_name,
++        nemo_flow.ScopeType.Agent,
++        metadata=metadata,
++    )
++    info_token = _graph_scope_info.set(
++        _GraphScopeInfo(
++            graph_name=graph_name,
++            metadata=metadata,
++            graph_handle=handle,
++            inherited_depends_on_task_ids=inherited_depends_on_task_ids,
++        )
++    )
++    writers_token = _graph_channel_writers.set({})
++    restores = dict(_graph_scope_restores.get({}))
++    restores[id(handle)] = _GraphScopeRestore(info_token, writers_token)
++    _graph_scope_restores.set(restores)
++    return handle
++
++
++def pop_graph_scope(handle: Any) -> None:
++    try:
++        nemo_flow.scope.pop(handle)
++    finally:
++        restores = dict(_graph_scope_restores.get({}))
++        restore = restores.pop(id(handle), None)
++        _graph_scope_restores.set(restores)
++        if restore is None:
++            _graph_scope_info.set(None)
++            _graph_channel_writers.set({})
++        else:
++            _graph_scope_info.reset(restore.info_token)
++            _graph_channel_writers.reset(restore.writers_token)
++
++
++def push_subgraph_scope(graph_name: str) -> tuple[Any, contextvars.Token]:
++    metadata = _graph_scope_metadata(run_boundary=False)
++    metadata["nemo_flow.graph.subgraph"] = True
++    parent_node = _current_node_context.get(None)
++    inherited_depends_on_task_ids = (
++        parent_node.depends_on_task_ids if parent_node is not None else ()
++    )
++    handle = nemo_flow.scope.push(
++        graph_name,
++        nemo_flow.ScopeType.Agent,
++        metadata=metadata,
++    )
++    info_token = _graph_scope_info.set(
++        _GraphScopeInfo(
++            graph_name=graph_name,
++            metadata=metadata,
++            graph_handle=handle,
++            inherited_depends_on_task_ids=inherited_depends_on_task_ids,
++        )
++    )
++    return handle, info_token
++
++
++def pop_subgraph_scope(handle: Any, info_token: contextvars.Token) -> None:
++    try:
++        nemo_flow.scope.pop(handle)
++    finally:
++        _graph_scope_info.reset(info_token)
++
++
++def push_node_scope(
++    task_name: str,
++    task_id: str,
++    *,
++    depends_on_task_ids: list[str] | None = None,
++) -> tuple[Any, Any | None, Any | None]:
++    parent_stack = nemo_flow.propagate_scope_to_thread()
++
++    branch_stack = nemo_flow.create_scope_stack()
++    saved_token = nemo_flow._scope_stack_var.set(branch_stack)
++    nemo_flow.set_thread_scope_stack(branch_stack)
++
++    info = _graph_scope_info.get(None)
++    graph_name = info.graph_name if info else "graph"
++    graph_metadata = dict(info.metadata) if info else _graph_scope_metadata(run_boundary=False)
++    graph_metadata["nemo_flow.run_boundary"] = False
++    graph_parent = info.graph_handle if info else None
++    graph_handle = nemo_flow.scope.push(
++        graph_name,
++        nemo_flow.ScopeType.Agent,
++        handle=graph_parent,
++        metadata=graph_metadata,
++    )
++
++    merged_depends_on_task_ids = _merge_task_ids(
++        info.inherited_depends_on_task_ids if info else (),
++        depends_on_task_ids,
++    )
++    node_context_token = _current_node_context.set(
++        _NodeDependencyContext(task_id=task_id, depends_on_task_ids=tuple(merged_depends_on_task_ids))
++    )
++
++    node_metadata: dict[str, Any] = {
++        "nemo_flow.graph.node": True,
++        "nemo_flow.run_boundary": False,
++        "nemo_flow.graph.task_id": task_id,
++        "nemo_flow.graph.node_name": task_name,
++    }
++    if merged_depends_on_task_ids:
++        node_metadata["nemo_flow.graph.depends_on_task_ids"] = merged_depends_on_task_ids
++
++    node_handle = nemo_flow.scope.push(
++        task_name,
++        nemo_flow.ScopeType.Agent,
++        metadata=node_metadata,
++    )
++    return node_handle, graph_handle, _BranchScopeRestore(saved_token, parent_stack, node_context_token)
++
++
++def pop_node_scope(
++    node_handle: Any,
++    graph_handle: Any | None,
++    saved_token: Any | None = None,
++) -> None:
++    restore = saved_token
++    parent_stack = None
++    if isinstance(saved_token, _BranchScopeRestore):
++        restore = saved_token.context_token
++        parent_stack = saved_token.parent_stack
++        node_context_token = saved_token.node_context_token
++    else:
++        node_context_token = None
++
++    try:
++        nemo_flow.scope.pop(node_handle)
++        if graph_handle is not None:
++            nemo_flow.scope.pop(graph_handle)
++    finally:
++        try:
++            if node_context_token is not None:
++                _current_node_context.reset(node_context_token)
++            if restore is not None:
++                nemo_flow._scope_stack_var.reset(restore)
++        finally:
++            if parent_stack is not None:
++                nemo_flow.set_thread_scope_stack(parent_stack)
++
++
++def record_task_writes(step: int, task_id: str, writes: Any) -> None:
++    if task_id == _NULL_TASK_ID:
++        return
++    writers = dict(_graph_channel_writers.get({}))
++    changed = False
++    for channel, _ in writes:
++        if not isinstance(channel, str) or channel in _SPECIAL_WRITE_CHANNELS:
++            continue
++        previous_step, task_ids = writers.get(channel, (step, []))
++        if previous_step != step:
++            task_ids = []
++        if task_id not in task_ids:
++            task_ids.append(task_id)
++        writers[channel] = (step, task_ids)
++        changed = True
++    if changed:
++        _graph_channel_writers.set(writers)
++
++
++def dependency_task_ids_for_triggers(triggers: Any) -> list[str]:
++    writers = _graph_channel_writers.get({})
++    depends_on_task_ids: list[str] = []
++    for trigger in triggers or ():
++        entry = writers.get(trigger)
++        if entry is None:
++            continue
++        for task_id in entry[1]:
++            if task_id not in depends_on_task_ids:
++                depends_on_task_ids.append(task_id)
++    return depends_on_task_ids
+diff --git a/libs/langgraph/langgraph/pregel/_loop.py b/libs/langgraph/langgraph/pregel/_loop.py
+index 9b98fc9..41f0732 100644
+--- a/libs/langgraph/langgraph/pregel/_loop.py
++++ b/libs/langgraph/langgraph/pregel/_loop.py
+@@ -428,6 +428,11 @@ class PregelLoop:
+             ]
+             writes_to_save = writes
+ 
++        from langgraph import _nemo_flow
++
++        if _nemo_flow.available():
++            _nemo_flow.record_task_writes(self.step, task_id, writes)
++
+         # check if any writes are to an UntrackedValue channel
+         if any(
+             isinstance(channel, UntrackedValue) for channel in self.channels.values()
+diff --git a/libs/langgraph/langgraph/pregel/_retry.py b/libs/langgraph/langgraph/pregel/_retry.py
+index acade96..4ee6041 100644
+--- a/libs/langgraph/langgraph/pregel/_retry.py
++++ b/libs/langgraph/langgraph/pregel/_retry.py
+@@ -581,8 +581,32 @@ def run_with_retry(
+         try:
+             # clear any writes from previous attempts
+             task.writes.clear()
++            from langgraph import _nemo_flow
++
++            _node_handle = None
++            _branch_graph_handle = None
++            _saved_stack = None
++            if _nemo_flow.available():
++                depends_on_task_ids = _nemo_flow.dependency_task_ids_for_triggers(
++                    task.triggers
++                )
++                _node_handle, _branch_graph_handle, _saved_stack = (
++                    _nemo_flow.push_node_scope(
++                        task.name,
++                        str(task.id),
++                        depends_on_task_ids=depends_on_task_ids,
++                    )
++                )
+             # run the task
+-            return task.proc.invoke(task.input, config)
++            try:
++                return task.proc.invoke(task.input, config)
++            finally:
++                if _node_handle is not None:
++                    _nemo_flow.pop_node_scope(
++                        _node_handle,
++                        _branch_graph_handle,
++                        _saved_stack,
++                    )
+         except ParentCommand as exc:
+             ns: str = config[CONF][CONFIG_KEY_CHECKPOINT_NS]
+             cmd = exc.args[0]
+@@ -698,15 +722,39 @@ async def arun_with_retry(
+         )
+         try:
+             task.writes.clear()
+-            if resolved_timeout is None:
+-                if stream:
+-                    async for _ in task.proc.astream(task.input, config):
+-                        pass
+-                    break
+-                return await task.proc.ainvoke(task.input, config)
+-            result = await _arun_with_timeout(
+-                task, config, resolved_timeout, attempt_ctx, stream=stream
+-            )
++            from langgraph import _nemo_flow
++
++            _node_handle = None
++            _branch_graph_handle = None
++            _saved_stack = None
++            if _nemo_flow.available():
++                depends_on_task_ids = _nemo_flow.dependency_task_ids_for_triggers(
++                    task.triggers
++                )
++                _node_handle, _branch_graph_handle, _saved_stack = (
++                    _nemo_flow.push_node_scope(
++                        task.name,
++                        str(task.id),
++                        depends_on_task_ids=depends_on_task_ids,
++                    )
++                )
++            try:
++                if resolved_timeout is None:
++                    if stream:
++                        async for _ in task.proc.astream(task.input, config):
++                            pass
++                        break
++                    return await task.proc.ainvoke(task.input, config)
++                result = await _arun_with_timeout(
++                    task, config, resolved_timeout, attempt_ctx, stream=stream
++                )
++            finally:
++                if _node_handle is not None:
++                    _nemo_flow.pop_node_scope(
++                        _node_handle,
++                        _branch_graph_handle,
++                        _saved_stack,
++                    )
+             _finish_timed_attempt(config, attempt_ctx)
+             if stream:
+                 # if successful, end
+diff --git a/libs/langgraph/langgraph/pregel/main.py b/libs/langgraph/langgraph/pregel/main.py
+index 1550e5a..9a22889 100644
+--- a/libs/langgraph/langgraph/pregel/main.py
++++ b/libs/langgraph/langgraph/pregel/main.py
+@@ -2719,6 +2719,18 @@ class Pregel(
+         stream = SyncQueue()
+ 
+         config = ensure_config(self.config, config)
++        from langgraph import _nemo_flow
++
++        _nemo_flow_graph_handle = None
++        _nemo_flow_subgraph_token = None
++        if _nemo_flow.available():
++            graph_name = config.get("run_name") or self.get_name()
++            if CONFIG_KEY_TASK_ID in config.get(CONF, {}):
++                _nemo_flow_graph_handle, _nemo_flow_subgraph_token = (
++                    _nemo_flow.push_subgraph_scope(graph_name)
++                )
++            else:
++                _nemo_flow_graph_handle = _nemo_flow.push_graph_scope(graph_name)
+         run_manager = None
+         try:
+             # assign defaults
+@@ -2988,6 +3000,15 @@ class Pregel(
+             if run_manager is not None:
+                 run_manager.on_chain_error(e)
+             raise
++        finally:
++            if _nemo_flow_graph_handle is not None:
++                if _nemo_flow_subgraph_token is not None:
++                    _nemo_flow.pop_subgraph_scope(
++                        _nemo_flow_graph_handle,
++                        _nemo_flow_subgraph_token,
++                    )
++                else:
++                    _nemo_flow.pop_graph_scope(_nemo_flow_graph_handle)
+ 
+     @overload
+     def astream(
+@@ -3130,6 +3151,18 @@ class Pregel(
+         )
+ 
+         config = ensure_config(self.config, config)
++        from langgraph import _nemo_flow
++
++        _nemo_flow_graph_handle = None
++        _nemo_flow_subgraph_token = None
++        if _nemo_flow.available():
++            graph_name = config.get("run_name") or self.get_name()
++            if CONFIG_KEY_TASK_ID in config.get(CONF, {}):
++                _nemo_flow_graph_handle, _nemo_flow_subgraph_token = (
++                    _nemo_flow.push_subgraph_scope(graph_name)
++                )
++            else:
++                _nemo_flow_graph_handle = _nemo_flow.push_graph_scope(graph_name)
+         run_manager = None
+         try:
+             # assign defaults
+@@ -3467,6 +3500,15 @@ class Pregel(
+             if run_manager is not None:
+                 await asyncio.shield(run_manager.on_chain_error(e))
+             raise
++        finally:
++            if _nemo_flow_graph_handle is not None:
++                if _nemo_flow_subgraph_token is not None:
++                    _nemo_flow.pop_subgraph_scope(
++                        _nemo_flow_graph_handle,
++                        _nemo_flow_subgraph_token,
++                    )
++                else:
++                    _nemo_flow.pop_graph_scope(_nemo_flow_graph_handle)
+ 
+     @beta(message="The v3 streaming protocol on Pregel is experimental.")
+     def _pregel_stream_v3(

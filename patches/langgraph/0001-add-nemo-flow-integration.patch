@@ -88,6 +88,13 @@ index 000000000..224bf329e
 +    response_codec: object | None = None
 +
 +
++class _BranchScopeRestore(NamedTuple):
++    """State needed to restore the parent scope stack after a branch node."""
++
++    context_token: contextvars.Token
++    parent_stack: Any
++
++
 +# Stores the graph scope identity so run_with_retry can reconstruct it
 +# on a new (per-branch) scope stack.
 +_graph_scope_info: contextvars.ContextVar[_GraphScopeInfo | None] = (
@@ -108,9 +115,50 @@ index 000000000..224bf329e
 +    "__return__",
 +}
 +
++_INHERITED_ADAPTIVE_KEYS = {
++    "workflow_class",
++    "scheduling_class",
++    "latency_sensitivity",
++}
++
++
++def _adaptive_metadata_from(metadata: Any) -> dict[str, Any]:
++    if not isinstance(metadata, dict):
++        return {}
++    adaptive_metadata = metadata.get("nemo_flow_adaptive")
++    if not isinstance(adaptive_metadata, dict):
++        return {}
++    inherited = {
++        key: adaptive_metadata[key]
++        for key in _INHERITED_ADAPTIVE_KEYS
++        if key in adaptive_metadata
++    }
++    if not inherited:
++        return {}
++    return {"nemo_flow_adaptive": inherited}
++
++
++def _inherited_adaptive_metadata() -> dict[str, Any]:
++    try:
++        parent = nemo_flow.scope.get_handle()
++        metadata = _adaptive_metadata_from(getattr(parent, "metadata", None))
++        if metadata:
++            return metadata
++    except Exception:
++        pass
++
++    info = _graph_scope_info.get(None)
++    if info is not None:
++        metadata = _adaptive_metadata_from(info.metadata)
++        if metadata:
++            return metadata
++
++    return {}
++
 +
 +def _graph_scope_metadata(*, run_boundary: bool, subgraph: bool = False) -> dict[str, Any]:
 +    metadata: dict[str, Any] = {
++        **_inherited_adaptive_metadata(),
 +        "nemo_flow.graph.scope": True,
 +        "nemo_flow.run_boundary": run_boundary,
 +    }
@@ -240,8 +288,10 @@ index 000000000..224bf329e
 +    Must only be called after ``available()`` returns ``True``.
 +
 +    Returns ``(node_handle, graph_handle, saved_stack)`` where
-+    ``saved_stack`` is the ContextVar Token for restoring the parent stack.
++    ``saved_stack`` carries the ContextVar token and native parent stack.
 +    """
++    parent_stack = nemo_flow.propagate_scope_to_thread()
++
 +    # Create a fresh scope stack for this parallel branch and install it
 +    # in the ContextVar.  The Token lets us restore the parent on pop.
 +    branch_stack = nemo_flow.create_scope_stack()
@@ -277,7 +327,7 @@ index 000000000..224bf329e
 +        nemo_flow.ScopeType.Agent,
 +        metadata=node_metadata,
 +    )
-+    return node_handle, graph_handle, saved_token
++    return node_handle, graph_handle, _BranchScopeRestore(saved_token, parent_stack)
 +
 +
 +def record_task_writes(step: int, task_id: str, writes: Any) -> None:
@@ -319,11 +369,24 @@ index 000000000..224bf329e
 +
 +    Must only be called after ``available()`` returns ``True``.
 +    """
-+    nemo_flow.scope.pop(node_handle)
-+    if graph_handle is not None:
-+        nemo_flow.scope.pop(graph_handle)
-+    if saved_token is not None:
-+        nemo_flow._scope_stack_var.reset(saved_token)
++    restore = saved_token
++    if isinstance(saved_token, _BranchScopeRestore):
++        restore = saved_token.context_token
++        parent_stack = saved_token.parent_stack
++    else:
++        parent_stack = None
++
++    try:
++        nemo_flow.scope.pop(node_handle)
++        if graph_handle is not None:
++            nemo_flow.scope.pop(graph_handle)
++    finally:
++        try:
++            if restore is not None:
++                nemo_flow._scope_stack_var.reset(restore)
++        finally:
++            if parent_stack is not None:
++                nemo_flow.set_thread_scope_stack(parent_stack)
 +
 +
 +# ---------------------------------------------------------------------------

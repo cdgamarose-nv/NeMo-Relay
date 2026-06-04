@@ -737,7 +737,7 @@ fn structural_key_parts(
         return match graph.graph_name.as_deref() {
             Some(graph_name) => {
                 format!("{path}/graph:{graph_name}/node:{node_name}/{kind}:{name}")
-            },
+            }
             None => format!("{path}/node:{node_name}/{kind}:{name}"),
         };
     }
@@ -881,7 +881,10 @@ fn add_graph_dependency_edges(
     let mut nodes_by_task_id: HashMap<&str, Vec<usize>> = HashMap::new();
     for node in nodes {
         if let Some(task_id) = node.graph_task_id.as_deref() {
-            nodes_by_task_id.entry(task_id).or_default().push(node.index);
+            nodes_by_task_id
+                .entry(task_id)
+                .or_default()
+                .push(node.index);
         }
     }
 

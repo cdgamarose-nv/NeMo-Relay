@@ -194,6 +194,82 @@ fn test_resolve_root_scope_uuid_reads_current_stack_root() {
 }
 
 #[test]
+fn test_resolve_run_boundary_scope_uuid_matches_active_agent_boundary() {
+    set_thread_scope_stack(create_scope_stack());
+    let stack_root_uuid = current_scope_stack().read().unwrap().root_uuid();
+    let agent_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("aiq.chat")
+            .scope_type(ScopeType::Agent)
+            .build(),
+    )
+    .unwrap();
+    let graph_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("LangGraph")
+            .scope_type(ScopeType::Agent)
+            .metadata(serde_json::json!({"nemo_flow.run_boundary": false}))
+            .build(),
+    )
+    .unwrap();
+    let node_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("researcher")
+            .scope_type(ScopeType::Agent)
+            .metadata(serde_json::json!({"nemo_flow.run_boundary": false}))
+            .build(),
+    )
+    .unwrap();
+
+    assert_eq!(resolve_root_scope_uuid(), Some(stack_root_uuid));
+    assert_eq!(resolve_run_boundary_scope_uuid(), Some(agent_scope.uuid));
+
+    nemo_flow::api::scope::pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&node_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    nemo_flow::api::scope::pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&graph_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    nemo_flow::api::scope::pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&agent_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    set_thread_scope_stack(create_scope_stack());
+}
+
+#[test]
+fn test_resolve_run_boundary_scope_uuid_falls_back_to_stack_root() {
+    set_thread_scope_stack(create_scope_stack());
+    let stack_root_uuid = current_scope_stack().read().unwrap().root_uuid();
+    let graph_scope = nemo_flow::api::scope::push_scope(
+        nemo_flow::api::scope::PushScopeParams::builder()
+            .name("LangGraph")
+            .scope_type(ScopeType::Agent)
+            .metadata(serde_json::json!({"nemo_flow.run_boundary": false}))
+            .build(),
+    )
+    .unwrap();
+
+    assert_eq!(resolve_run_boundary_scope_uuid(), Some(stack_root_uuid));
+
+    nemo_flow::api::scope::pop_scope(
+        nemo_flow::api::scope::PopScopeParams::builder()
+            .handle_uuid(&graph_scope.uuid)
+            .build(),
+    )
+    .unwrap();
+    set_thread_scope_stack(create_scope_stack());
+}
+
+#[test]
 fn test_set_latency_sensitivity_ignores_non_object_metadata() {
     let stack_handle = current_scope_stack();
     let mut stack = stack_handle.write().unwrap();

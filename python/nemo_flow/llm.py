@@ -55,6 +55,7 @@ from nemo_flow._native import (
 from nemo_flow._native import (
     llm_stream_call_execute as _native_llm_stream_call_execute,
 )
+from nemo_flow.scope import _ensure_scope_stack
 
 if TYPE_CHECKING:
     from nemo_flow import Json
@@ -119,6 +120,7 @@ def call(
             metadata={"status": "success"},
         )
     """
+    _ensure_scope_stack()
     return _native_llm_call(
         name,
         request,
@@ -169,6 +171,7 @@ def call_end(
         ``timestamp`` must be a timezone-aware ``datetime``; strings and naive
         datetimes are rejected.
     """
+    _ensure_scope_stack()
     return _native_llm_call_end(
         handle,
         response,
@@ -256,6 +259,7 @@ def execute(
             response_codec=nemo_flow.codecs.OpenAIChatCodec(),
         )
     """
+    _ensure_scope_stack()
     return _native_llm_call_execute(
         name,
         request,
@@ -353,6 +357,7 @@ def stream_execute(
         async for chunk in stream:
             print(chunk)
     """
+    _ensure_scope_stack()
     return _native_llm_stream_call_execute(
         name,
         request,
@@ -384,6 +389,7 @@ def request_intercepts(name, request):
         This runs only the request-intercept chain. It does not execute
         guardrails, codecs, provider callbacks, or stream handling.
     """
+    _ensure_scope_stack()
     return _native_llm_request_intercepts(name, request)
 
 
@@ -402,6 +408,7 @@ def conditional_execution(request):
         This helper evaluates only conditional-execution guardrails and does
         not invoke request intercepts, codecs, or provider execution.
     """
+    _ensure_scope_stack()
     return _native_llm_conditional_execution(request)
 
 

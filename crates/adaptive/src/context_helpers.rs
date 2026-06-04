@@ -12,6 +12,7 @@
 //! - [`read_workflow_class`]: reads workflow scheduling class metadata for priority caps
 //! - [`resolve_agent_id`]: returns the first Agent scope name from the scope stack
 //! - [`resolve_root_scope_uuid`]: returns the current execution tree root UUID
+//! - [`resolve_run_boundary_scope_uuid`]: returns the active adaptive run UUID
 //!
 //! All functions are safe to call from sync contexts (intercepts are sync closures).
 //! They acquire a read lock on the scope stack, which is always fast.
@@ -39,6 +40,8 @@ pub const LATENCY_SENSITIVITY_POINTER: &str = "/nemo_flow_adaptive/latency_sensi
 pub const WORKFLOW_CLASS_POINTER: &str = "/nemo_flow_adaptive/workflow_class";
 /// Metadata key path for legacy workflow scheduling class annotation.
 pub const SCHEDULING_CLASS_POINTER: &str = "/nemo_flow_adaptive/scheduling_class";
+/// Metadata key path for adaptive run-boundary override.
+pub const RUN_BOUNDARY_POINTER: &str = "/nemo_flow.run_boundary";
 
 /// Workflow-level scheduling class visible on the current scope stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +285,37 @@ pub fn resolve_root_scope_uuid() -> Option<Uuid> {
         Err(_) => return None,
     };
     Some(stack.root_uuid())
+}
+
+/// Resolves the active adaptive run-boundary scope UUID.
+///
+/// This mirrors telemetry drain semantics: Agent scopes are run boundaries by
+/// default, unless their metadata explicitly sets `nemo_flow.run_boundary` to
+/// `false`. The deepest active boundary wins. If no explicit Agent boundary is
+/// visible, fall back to the implicit scope-stack root.
+pub fn resolve_run_boundary_scope_uuid() -> Option<Uuid> {
+    let stack_handle = current_scope_stack();
+    let stack = match stack_handle.read() {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    stack
+        .scopes()
+        .iter()
+        .skip(1)
+        .rev()
+        .find(|scope| {
+            matches!(scope.scope_type, ScopeType::Agent)
+                && scope
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.pointer(RUN_BOUNDARY_POINTER))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true)
+        })
+        .map(|scope| scope.uuid)
+        .or_else(|| Some(stack.root_uuid()))
 }
 
 /// Resolves the session-local identity used by warm-first cohort coordination.
