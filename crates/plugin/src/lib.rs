@@ -845,10 +845,10 @@ impl LlmStream {
         if self.finished {
             return Ok(None);
         }
-        let Some(next) = self.raw.next else {
-            self.finished = true;
-            return Err("LLM stream next callback was null".into());
-        };
+        let next = self
+            .raw
+            .next
+            .expect("LLM stream next callback is validated on construction");
         let mut out = ptr::null_mut();
         let status = unsafe { next(self.raw.user_data, &mut out) };
         match status {
@@ -1860,13 +1860,9 @@ fn finish_typed_registration<F>(
 }
 
 fn status_error(host: &NemoRelayNativeHostApiV1, status: NemoRelayStatus, label: &str) -> String {
-    match status {
-        NemoRelayStatus::Ok => format!("{label} succeeded"),
-        other => {
-            set_last_error(host, &format!("{label} failed: {other:?}"));
-            format!("{label} failed: {other:?}")
-        }
-    }
+    debug_assert_ne!(status, NemoRelayStatus::Ok);
+    set_last_error(host, &format!("{label} failed: {status:?}"));
+    format!("{label} failed: {status:?}")
 }
 
 fn callback_error(host: &NemoRelayNativeHostApiV1, message: String) -> NemoRelayStatus {
@@ -2607,13 +2603,7 @@ fn write_json<T: Serialize>(
         return NemoRelayStatus::NullPointer;
     }
     unsafe { *out = ptr::null_mut() };
-    let json = match serde_json::to_value(value) {
-        Ok(value) => value,
-        Err(error) => {
-            set_last_error(host, &format!("failed to serialize JSON: {error}"));
-            return NemoRelayStatus::Internal;
-        }
-    };
+    let json = serde_json::to_value(value).expect("Relay DTOs and serde_json::Value serialize");
     let Some(handle) = HostString::from_json(host, &json) else {
         set_last_error(host, "failed to allocate host string");
         return NemoRelayStatus::Internal;

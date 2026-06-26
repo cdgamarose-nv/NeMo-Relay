@@ -2143,7 +2143,7 @@ fn typed_tool_intercept_registration_rewrites_json() {
     assert_eq!(registration.name, "tool");
     assert_eq!(registration.priority, 17);
     assert!(registration.break_chain);
-    let name = host_string(&host, "tool");
+    let name = host_string(&host, "");
     let payload = json_host_string(&host, json!({ "input": "value" }));
     let mut out = ptr::null_mut();
     let status = unsafe {
@@ -2408,6 +2408,23 @@ fn typed_callbacks_reject_null_abi_pointers_before_decoding_inputs() {
                 ptr::null_mut(),
             )
         },
+        NemoRelayStatus::NullPointer
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(payload);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_tool_request_intercept("tool", 0, false, |_name, value| Ok(value))
+        .unwrap();
+    let registration = take_tool_json_registration();
+    let name = host_string(&host, "tool");
+    let payload = json_host_string(&host, json!({}));
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe { (registration.cb)(ptr::null_mut(), name, payload, &mut out) },
         NemoRelayStatus::NullPointer
     );
     unsafe {
@@ -2708,6 +2725,489 @@ fn typed_callbacks_reject_null_abi_pointers_before_decoding_inputs() {
         (host.string_free)(name);
         (host.string_free)(request);
         drop(Box::from_raw(next_state));
+        registration.free();
+    }
+}
+
+#[test]
+fn typed_callbacks_report_invalid_json_for_each_decoder_family() {
+    let _guard = begin_test();
+    let host = test_host();
+
+    let mut ctx = test_context(&host);
+    ctx.register_subscriber("events", |_event: &Event| {})
+        .unwrap();
+    let registration = take_subscriber_registration();
+    let event = host_string(&host, "{not json");
+    assert_eq!(
+        unsafe { (registration.cb)(registration.user_data as *mut c_void, event) },
+        NemoRelayStatus::InvalidJson
+    );
+    unsafe {
+        (host.string_free)(event);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_tool_sanitize_request_guardrail("tool-sanitize", 0, |_name, value| value)
+        .unwrap();
+    let registration = take_tool_json_registration();
+    let name = host_string(&host, "tool");
+    let payload = host_string(&host, "{not json");
+    let stale_out = host_string(&host, r#"{"stale":true}"#);
+    let mut out = stale_out;
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                payload,
+                &mut out,
+            )
+        },
+        NemoRelayStatus::InvalidJson
+    );
+    assert!(out.is_null());
+    unsafe {
+        (host.string_free)(stale_out);
+        (host.string_free)(name);
+        (host.string_free)(payload);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_tool_conditional_execution_guardrail("tool-conditional", 0, |_name, _value| {
+        Ok(None)
+    })
+    .unwrap();
+    let registration = take_tool_conditional_registration();
+    let name = host_string(&host, "tool");
+    let payload = host_string(&host, "{not json");
+    let stale_reason = host_string(&host, "stale");
+    let mut reason = stale_reason;
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                payload,
+                &mut reason,
+            )
+        },
+        NemoRelayStatus::InvalidJson
+    );
+    assert!(reason.is_null());
+    unsafe {
+        (host.string_free)(stale_reason);
+        (host.string_free)(name);
+        (host.string_free)(payload);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_tool_execution_intercept("tool-exec", 0, |_name, value, _next| Ok(value))
+        .unwrap();
+    let registration = take_tool_execution_registration();
+    let name = host_string(&host, "tool");
+    let payload = host_string(&host, "{not json");
+    let stale_out = host_string(&host, r#"{"stale":true}"#);
+    let mut out = stale_out;
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                payload,
+                fake_tool_next,
+                ptr::null_mut(),
+                &mut out,
+            )
+        },
+        NemoRelayStatus::InvalidJson
+    );
+    assert!(out.is_null());
+    unsafe {
+        (host.string_free)(stale_out);
+        (host.string_free)(name);
+        (host.string_free)(payload);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_sanitize_request_guardrail("llm-request", 0, |request| request)
+        .unwrap();
+    let registration = take_llm_request_registration();
+    let request = host_string(&host, "{not json");
+    let stale_out = host_string(&host, r#"{"stale":true}"#);
+    let mut out = stale_out;
+    assert_eq!(
+        unsafe { (registration.cb)(registration.user_data as *mut c_void, request, &mut out) },
+        NemoRelayStatus::InvalidJson
+    );
+    assert!(out.is_null());
+    unsafe {
+        (host.string_free)(stale_out);
+        (host.string_free)(request);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_sanitize_response_guardrail("llm-response", 0, |value| value)
+        .unwrap();
+    let registration = take_llm_json_registration();
+    let response = host_string(&host, "{not json");
+    let stale_out = host_string(&host, r#"{"stale":true}"#);
+    let mut out = stale_out;
+    assert_eq!(
+        unsafe { (registration.cb)(registration.user_data as *mut c_void, response, &mut out) },
+        NemoRelayStatus::InvalidJson
+    );
+    assert!(out.is_null());
+    unsafe {
+        (host.string_free)(stale_out);
+        (host.string_free)(response);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_conditional_execution_guardrail("llm-conditional", 0, |_request| Ok(None))
+        .unwrap();
+    let registration = take_llm_conditional_registration();
+    let request = host_string(&host, "{not json");
+    let stale_reason = host_string(&host, "stale");
+    let mut reason = stale_reason;
+    assert_eq!(
+        unsafe { (registration.cb)(registration.user_data as *mut c_void, request, &mut reason) },
+        NemoRelayStatus::InvalidJson
+    );
+    assert!(reason.is_null());
+    unsafe {
+        (host.string_free)(stale_reason);
+        (host.string_free)(request);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_request_intercept("llm-request", 0, false, |_name, request, ann| {
+        Ok((request, ann))
+    })
+    .unwrap();
+    let registration = take_llm_request_intercept_registration();
+    let name = host_string(&host, "llm");
+    let bad_request = host_string(&host, "{not json");
+    let mut out_request = ptr::null_mut();
+    let mut out_annotated = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                bad_request,
+                ptr::null(),
+                &mut out_request,
+                &mut out_annotated,
+            )
+        },
+        NemoRelayStatus::InvalidJson
+    );
+    let request = json_host_string(&host, serde_json::to_value(test_llm_request()).unwrap());
+    let bad_annotation = host_string(&host, "{not json");
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                request,
+                bad_annotation,
+                &mut out_request,
+                &mut out_annotated,
+            )
+        },
+        NemoRelayStatus::InvalidJson
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(bad_request);
+        (host.string_free)(request);
+        (host.string_free)(bad_annotation);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_execution_intercept(
+        "llm-exec",
+        0,
+        |_name, request, _next| Ok(request.content),
+    )
+    .unwrap();
+    let registration = take_llm_execution_registration();
+    let name = host_string(&host, "llm");
+    let request = host_string(&host, "{not json");
+    let stale_out = host_string(&host, r#"{"stale":true}"#);
+    let mut out = stale_out;
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                request,
+                failing_llm_next,
+                ptr::null_mut(),
+                &mut out,
+            )
+        },
+        NemoRelayStatus::InvalidJson
+    );
+    assert!(out.is_null());
+    unsafe {
+        (host.string_free)(stale_out);
+        (host.string_free)(name);
+        (host.string_free)(request);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_stream_execution_intercept("llm-stream", 0, |_name, _request, _next| {
+        Ok(Box::new(std::iter::empty()))
+    })
+    .unwrap();
+    let registration = take_llm_stream_execution_registration();
+    let name = host_string(&host, "llm");
+    let request = host_string(&host, "{not json");
+    let mut stream = NemoRelayNativeLlmStreamV1::default();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                request,
+                fake_llm_stream_next,
+                ptr::null_mut(),
+                &mut stream,
+            )
+        },
+        NemoRelayStatus::InvalidJson
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(request);
+        registration.free();
+    }
+}
+
+#[test]
+fn typed_callbacks_map_additional_callback_errors() {
+    let _guard = begin_test();
+    let host = test_host();
+
+    let mut ctx = test_context(&host);
+    ctx.register_tool_conditional_execution_guardrail("tool-conditional", 0, |_name, _value| {
+        Err("tool conditional failed".into())
+    })
+    .unwrap();
+    let registration = take_tool_conditional_registration();
+    let name = host_string(&host, "tool");
+    let args = json_host_string(&host, json!({}));
+    let mut reason = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                args,
+                &mut reason,
+            )
+        },
+        NemoRelayStatus::Internal
+    );
+    assert_eq!(
+        LAST_ERROR.lock().unwrap().as_deref(),
+        Some("tool conditional failed")
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(args);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_tool_execution_intercept("tool-exec", 0, |_name, _value, _next| {
+        Err("tool execution failed".into())
+    })
+    .unwrap();
+    let registration = take_tool_execution_registration();
+    let name = host_string(&host, "tool");
+    let args = json_host_string(&host, json!({}));
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                args,
+                fake_tool_next,
+                ptr::null_mut(),
+                &mut out,
+            )
+        },
+        NemoRelayStatus::Internal
+    );
+    assert_eq!(
+        LAST_ERROR.lock().unwrap().as_deref(),
+        Some("tool execution failed")
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(args);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_conditional_execution_guardrail("llm-conditional", 0, |_request| {
+        Err("llm conditional failed".into())
+    })
+    .unwrap();
+    let registration = take_llm_conditional_registration();
+    let request = json_host_string(&host, serde_json::to_value(test_llm_request()).unwrap());
+    let mut reason = ptr::null_mut();
+    assert_eq!(
+        unsafe { (registration.cb)(registration.user_data as *mut c_void, request, &mut reason) },
+        NemoRelayStatus::Internal
+    );
+    assert_eq!(
+        LAST_ERROR.lock().unwrap().as_deref(),
+        Some("llm conditional failed")
+    );
+    unsafe {
+        (host.string_free)(request);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_request_intercept("llm-request", 0, false, |_name, _request, _ann| {
+        Err("llm request failed".into())
+    })
+    .unwrap();
+    let registration = take_llm_request_intercept_registration();
+    let name = host_string(&host, "llm");
+    let request = json_host_string(&host, serde_json::to_value(test_llm_request()).unwrap());
+    let mut out_request = ptr::null_mut();
+    let mut out_annotated = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                request,
+                ptr::null(),
+                &mut out_request,
+                &mut out_annotated,
+            )
+        },
+        NemoRelayStatus::Internal
+    );
+    assert_eq!(
+        LAST_ERROR.lock().unwrap().as_deref(),
+        Some("llm request failed")
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(request);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_execution_intercept("llm-exec", 0, |_name, _request, _next| {
+        Err("llm execution failed".into())
+    })
+    .unwrap();
+    let registration = take_llm_execution_registration();
+    let name = host_string(&host, "llm");
+    let request = json_host_string(&host, serde_json::to_value(test_llm_request()).unwrap());
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                request,
+                failing_llm_next,
+                ptr::null_mut(),
+                &mut out,
+            )
+        },
+        NemoRelayStatus::Internal
+    );
+    assert_eq!(
+        LAST_ERROR.lock().unwrap().as_deref(),
+        Some("llm execution failed")
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(request);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_execution_intercept(
+        "llm-exec",
+        0,
+        |_name, request, _next| Ok(request.content),
+    )
+    .unwrap();
+    let registration = take_llm_execution_registration();
+    let name = host_string(&host, "llm");
+    let request = json_host_string(&host, serde_json::to_value(test_llm_request()).unwrap());
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                request,
+                failing_llm_next,
+                ptr::null_mut(),
+                &mut out,
+            )
+        },
+        NemoRelayStatus::Ok
+    );
+    assert_eq!(read_json_and_free(&host, out), json!({ "input": true }));
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(request);
+        registration.free();
+    }
+
+    let mut ctx = test_context(&host);
+    ctx.register_llm_stream_execution_intercept("llm-stream", 0, |_name, _request, _next| {
+        Err("llm stream failed".into())
+    })
+    .unwrap();
+    let registration = take_llm_stream_execution_registration();
+    let name = host_string(&host, "llm");
+    let request = json_host_string(&host, serde_json::to_value(test_llm_request()).unwrap());
+    let mut stream = NemoRelayNativeLlmStreamV1::default();
+    assert_eq!(
+        unsafe {
+            (registration.cb)(
+                registration.user_data as *mut c_void,
+                name,
+                request,
+                fake_llm_stream_next,
+                ptr::null_mut(),
+                &mut stream,
+            )
+        },
+        NemoRelayStatus::Internal
+    );
+    assert_eq!(
+        LAST_ERROR.lock().unwrap().as_deref(),
+        Some("llm stream failed")
+    );
+    unsafe {
+        (host.string_free)(name);
+        (host.string_free)(request);
         registration.free();
     }
 }
@@ -3465,6 +3965,16 @@ fn typed_llm_stream_execution_wraps_next_chunks() {
     assert_eq!(status, NemoRelayStatus::Ok);
     assert_eq!(called.load(Ordering::SeqCst), 1);
 
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe { stream.next.unwrap()(ptr::null_mut(), &mut out) },
+        NemoRelayStatus::NullPointer
+    );
+    assert_eq!(
+        unsafe { stream.next.unwrap()(stream.user_data, ptr::null_mut()) },
+        NemoRelayStatus::NullPointer
+    );
+
     let (status, chunk) = poll_stream_chunk(&host, &stream);
     assert_eq!(status, NemoRelayStatus::Ok);
     assert_eq!(chunk.unwrap()["wrapped"], json!(true));
@@ -3476,6 +3986,17 @@ fn typed_llm_stream_execution_wraps_next_chunks() {
     let (status, chunk) = poll_stream_chunk(&host, &stream);
     assert_eq!(status, NemoRelayStatus::StreamEnd);
     assert!(chunk.is_none());
+    let (status, chunk) = poll_stream_chunk(&host, &stream);
+    assert_eq!(status, NemoRelayStatus::StreamEnd);
+    assert!(chunk.is_none());
+    assert_eq!(
+        unsafe { stream.cancel.unwrap()(stream.user_data) },
+        NemoRelayStatus::Ok
+    );
+    assert_eq!(
+        unsafe { stream.cancel.unwrap()(ptr::null_mut()) },
+        NemoRelayStatus::NullPointer
+    );
 
     unsafe {
         drop_stream(&mut stream);
@@ -4405,6 +4926,14 @@ fn exported_entry_symbol_validates_args_before_constructor() {
     assert!(plugin.validate.is_none());
     assert!(plugin.register.is_none());
     assert!(plugin.drop.is_none());
+
+    let mut short_host = host;
+    short_host.struct_size = size_of::<NemoRelayNativeHostApiV1>() - 1;
+    assert_eq!(
+        unsafe { constructor_counting_entry(&short_host, &mut plugin) },
+        NemoRelayStatus::InvalidArg
+    );
+    assert_eq!(CONSTRUCTOR_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]

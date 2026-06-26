@@ -75,7 +75,7 @@ kind = "worker"
 
 [compat]
 relay = "0.1"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false

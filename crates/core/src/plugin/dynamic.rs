@@ -48,6 +48,10 @@ pub enum DynamicPluginKind {
 pub enum WorkerRuntime {
     /// Python worker runtime.
     Python,
+    /// Rust worker executable runtime.
+    Rust,
+    /// Generic executable worker runtime.
+    Command,
 }
 
 /// Relay-enforced capability declared by a dynamic plugin.

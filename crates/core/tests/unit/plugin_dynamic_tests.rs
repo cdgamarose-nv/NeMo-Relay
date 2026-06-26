@@ -43,7 +43,7 @@ fn sample_record() -> DynamicPluginRecord {
         },
         compatibility: DynamicPluginCompatibility::Worker(DynamicPluginWorkerCompatibility {
             relay: ">=0.1.0,<0.2.0".into(),
-            worker_protocol: "1".into(),
+            worker_protocol: "grpc-v1".into(),
         }),
         load: DynamicPluginLoadContract::Worker(DynamicPluginWorkerLoadContract {
             runtime: WorkerRuntime::Python,
@@ -265,7 +265,7 @@ fn registry_rejects_missing_raw_record_relay_compatibility() {
     let mut record = sample_record();
     record.compatibility = DynamicPluginCompatibility::Worker(DynamicPluginWorkerCompatibility {
         relay: String::new(),
-        worker_protocol: "1".into(),
+        worker_protocol: "grpc-v1".into(),
     });
 
     let err = registry
@@ -286,7 +286,7 @@ fn registry_add_canonicalizes_required_record_strings_before_storage() {
     record.metadata.id = " acme.guardrails.pii ".into();
     record.compatibility = DynamicPluginCompatibility::Worker(DynamicPluginWorkerCompatibility {
         relay: " >=0.1.0,<0.2.0 ".into(),
-        worker_protocol: " 1 ".into(),
+        worker_protocol: " grpc-v1 ".into(),
     });
     record.load = DynamicPluginLoadContract::Worker(DynamicPluginWorkerLoadContract {
         runtime: WorkerRuntime::Python,
@@ -299,7 +299,7 @@ fn registry_add_canonicalizes_required_record_strings_before_storage() {
         stored.compatibility,
         DynamicPluginCompatibility::Worker(DynamicPluginWorkerCompatibility {
             relay: ">=0.1.0,<0.2.0".into(),
-            worker_protocol: "1".into(),
+            worker_protocol: "grpc-v1".into(),
         })
     );
     assert_eq!(
@@ -478,7 +478,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false
@@ -587,7 +587,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false
@@ -626,7 +626,7 @@ kind = "worker"
 
 [compat]
 relay = " >=0.1.0,<0.2.0 "
-worker_protocol = " 1 "
+worker_protocol = " grpc-v1 "
 
 [defaults]
 enabled = false
@@ -649,7 +649,7 @@ entrypoint = " acme_guardrails.plugin:register "
         record.compatibility,
         DynamicPluginCompatibility::Worker(DynamicPluginWorkerCompatibility {
             relay: ">=0.1.0,<0.2.0".into(),
-            worker_protocol: "1".into(),
+            worker_protocol: "grpc-v1".into(),
         })
     );
     assert_eq!(
@@ -659,6 +659,85 @@ entrypoint = " acme_guardrails.plugin:register "
             entrypoint: "acme_guardrails.plugin:register".into(),
         })
     );
+}
+
+#[test]
+fn manifest_parse_accepts_rust_and_command_worker_runtimes() {
+    for (runtime, expected) in [
+        ("rust", WorkerRuntime::Rust),
+        ("command", WorkerRuntime::Command),
+    ] {
+        let manifest = DynamicPluginManifest::parse_toml(&format!(
+            r#"
+manifest_version = 1
+
+[plugin]
+id = "acme.guardrails.{runtime}"
+kind = "worker"
+
+[compat]
+relay = ">=0.1.0,<0.2.0"
+worker_protocol = "grpc-v1"
+
+[defaults]
+enabled = false
+
+[capabilities]
+items = ["plugin_worker"]
+
+[load]
+runtime = "{runtime}"
+entrypoint = "acme_guardrails.plugin:register"
+"#
+        ))
+        .expect("parse worker manifest");
+
+        let record = manifest
+            .into_record(None)
+            .expect("manifest converts into record");
+        assert_eq!(
+            record.load,
+            DynamicPluginLoadContract::Worker(DynamicPluginWorkerLoadContract {
+                runtime: expected,
+                entrypoint: "acme_guardrails.plugin:register".into(),
+            })
+        );
+    }
+}
+
+#[test]
+fn manifest_rejects_unsupported_worker_protocol() {
+    let err = DynamicPluginManifest::parse_toml(
+        r#"
+manifest_version = 1
+
+[plugin]
+id = "acme.guardrails.future-worker"
+kind = "worker"
+
+[compat]
+relay = ">=0.1.0,<0.2.0"
+worker_protocol = "grpc-v2"
+
+[defaults]
+enabled = false
+
+[capabilities]
+items = ["plugin_worker"]
+
+[load]
+runtime = "python"
+entrypoint = "acme_guardrails.plugin:register"
+"#,
+    )
+    .expect_err("unsupported worker protocol should fail");
+
+    match err {
+        PluginError::InvalidConfig(message) => {
+            assert!(message.contains("grpc-v1"), "{message}");
+        }
+        other => panic!("unexpected worker protocol error: {other}"),
+    }
 }
 
 #[test]
@@ -768,7 +847,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false
@@ -981,7 +1060,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = true
@@ -1016,7 +1095,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false
@@ -1150,7 +1229,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false
@@ -1185,7 +1264,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false
@@ -1223,7 +1302,7 @@ kind = "worker"
 
 [compat]
 relay = ">=0.1.0,<0.2.0"
-worker_protocol = "1"
+worker_protocol = "grpc-v1"
 
 [defaults]
 enabled = false
